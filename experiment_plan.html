@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>视觉跟随自动驾驶 · 实验计划</title>
+<style>
+  :root{
+    --bg:#0a0e14; --bg2:#0d1117; --card:#141a22; --card2:#11161d;
+    --border:#232b36; --border2:#2d3744;
+    --text:#e6edf3; --muted:#8b949e; --faint:#6b7585;
+    --cyan:#2dd4bf; --blue:#60a5fa; --purple:#a78bfa;
+    --green:#3fb950; --yellow:#d6a516; --red:#f85149; --orange:#f0883e;
+    --mono:"SF Mono","JetBrains Mono","Fira Code",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    background:radial-gradient(1200px 600px at 70% -10%,#10212b 0%,var(--bg) 55%) fixed,var(--bg);
+    color:var(--text); line-height:1.65; padding:0 20px 120px;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1080px;margin:0 auto}
+  a{color:var(--cyan);text-decoration:none}
+
+  /* ---------- HERO ---------- */
+  header.hero{padding:72px 0 40px;border-bottom:1px solid var(--border)}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.22em;color:var(--cyan);text-transform:uppercase;margin-bottom:18px}
+  h1{font-size:42px;line-height:1.15;font-weight:800;letter-spacing:-.01em;
+     background:linear-gradient(120deg,#fff 20%,#9fe7df 55%,#7cc4ff 90%);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .sub{font-size:18px;color:var(--muted);margin-top:16px;max-width:680px}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:24px}
+  .chip{font-family:var(--mono);font-size:12px;padding:5px 11px;border:1px solid var(--border2);border-radius:20px;color:var(--muted);background:var(--card2)}
+  .chip b{color:var(--cyan);font-weight:600}
+
+  /* progress bar */
+  .progress{display:flex;gap:10px;margin-top:34px}
+  .pstep{flex:1;background:var(--card2);border:1px solid var(--border);border-radius:12px;padding:14px 16px;position:relative;overflow:hidden}
+  .pstep .pnum{font-family:var(--mono);font-size:11px;color:var(--faint)}
+  .pstep .pname{font-weight:700;font-size:15px;margin-top:3px}
+  .pstep .pstat{font-size:12px;margin-top:6px;color:var(--muted)}
+  .pstep.active{border-color:var(--blue)}
+  .pstep.active::before{content:"";position:absolute;inset:0;background:linear-gradient(180deg,rgba(96,165,250,.12),transparent)}
+  .pstep.active .pstat{color:var(--blue)}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:middle}
+  .dot.b{background:var(--blue);box-shadow:0 0 8px var(--blue)} .dot.g{background:var(--faint)}
+
+  /* ---------- SECTIONS ---------- */
+  section{margin-top:64px;opacity:0;transform:translateY(18px);transition:.6s cubic-bezier(.2,.7,.2,1)}
+  section.in{opacity:1;transform:none}
+  .stag{font-family:var(--mono);font-size:12px;letter-spacing:.18em;color:var(--faint);text-transform:uppercase}
+  h2{font-size:27px;font-weight:750;margin:8px 0 6px;letter-spacing:-.01em}
+  .lead{color:var(--muted);max-width:760px;margin-bottom:26px}
+
+  /* status grid */
+  .grid{display:grid;gap:16px}
+  .g3{grid-template-columns:repeat(3,1fr)}
+  .g2{grid-template-columns:repeat(2,1fr)}
+  @media(max-width:760px){.g3,.g2{grid-template-columns:1fr}.progress{flex-direction:column}h1{font-size:32px}}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px}
+  .card h3{font-size:15px;margin-bottom:10px;display:flex;align-items:center;gap:8px}
+  .card p,.card li{font-size:14px;color:var(--muted)}
+  .card ul{list-style:none;margin-top:4px}
+  .card li{padding-left:16px;position:relative;margin:5px 0}
+  .card li::before{content:"›";position:absolute;left:0;color:var(--cyan)}
+
+  /* metric cards */
+  .metric{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:22px;position:relative;overflow:hidden}
+  .metric .big{font-family:var(--mono);font-size:34px;font-weight:700;letter-spacing:-.02em}
+  .metric .lbl{font-size:13px;color:var(--muted);margin-top:4px}
+  .metric .desc{font-size:13px;color:var(--faint);margin-top:12px;border-top:1px dashed var(--border2);padding-top:12px}
+  .metric .verdict{display:inline-block;font-family:var(--mono);font-size:11px;padding:3px 9px;border-radius:6px;margin-top:14px;font-weight:600}
+  .v-good{background:rgba(63,185,80,.14);color:var(--green)}
+  .v-bad{background:rgba(248,81,73,.13);color:var(--red)}
+  .v-warn{background:rgba(214,165,22,.14);color:var(--yellow)}
+  .metric.good{border-color:rgba(63,185,80,.35)} .metric.good .big{color:var(--green)}
+  .metric.bad .big{color:var(--red)} .metric.warn .big{color:var(--yellow)}
+
+  /* ---------- ROADMAP ---------- */
+  .phase{position:relative;padding-left:38px;margin-top:30px}
+  .phase::before{content:"";position:absolute;left:11px;top:8px;bottom:-30px;width:2px;background:var(--border2)}
+  .phase:last-child::before{display:none}
+  .phase .pin{position:absolute;left:0;top:2px;width:24px;height:24px;border-radius:50%;display:grid;place-items:center;font-family:var(--mono);font-size:12px;font-weight:700;color:#0a0e14}
+  .ph1 .pin{background:var(--blue)} .ph2 .pin{background:var(--cyan)} .ph3 .pin{background:var(--purple)}
+  .phase .ptitle{font-size:21px;font-weight:750;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .badge{font-family:var(--mono);font-size:11px;padding:3px 9px;border-radius:20px;font-weight:600}
+  .b-now{background:rgba(96,165,250,.16);color:var(--blue);border:1px solid rgba(96,165,250,.4)}
+  .b-next{background:rgba(45,212,191,.14);color:var(--cyan);border:1px solid rgba(45,212,191,.35)}
+  .b-explore{background:rgba(167,139,250,.14);color:var(--purple);border:1px solid rgba(167,139,250,.35)}
+  .phase .pgoal{color:var(--muted);margin:10px 0 16px;max-width:780px}
+  .pbody{background:var(--card2);border:1px solid var(--border);border-radius:14px;padding:20px;margin-bottom:8px}
+  .pbody h4{font-size:13px;font-family:var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--faint);margin:16px 0 8px}
+  .pbody h4:first-child{margin-top:0}
+  .pbody ul{list-style:none} .pbody li{font-size:14px;color:var(--text);padding-left:18px;position:relative;margin:6px 0}
+  .pbody li::before{content:"▸";position:absolute;left:0;color:var(--cyan);font-size:12px;top:1px}
+  .pbody li .why{color:var(--faint);font-size:13px}
+  .tstack{display:flex;flex-wrap:wrap;gap:7px;margin-top:6px}
+  .tstack span{font-family:var(--mono);font-size:11px;padding:4px 9px;border:1px solid var(--border2);border-radius:6px;color:var(--muted);background:var(--bg2)}
+
+  /* ---------- ARCHITECTURE ---------- */
+  .arch{background:linear-gradient(180deg,#0e151c,#0b1118);border:1px solid var(--border2);border-radius:16px;padding:28px 22px;margin-top:18px}
+  .arch-io{text-align:center;font-family:var(--mono);font-size:13px;color:var(--muted)}
+  .arch-io b{color:var(--cyan)}
+  .flow{display:flex;flex-direction:column;align-items:center;gap:0;margin:6px 0}
+  .layer{display:flex;align-items:center;justify-content:space-between;gap:14px;width:100%;max-width:560px;
+          background:var(--card);border:1px solid var(--border2);border-radius:10px;padding:11px 16px}
+  .layer .lname{font-weight:650;font-size:14px}
+  .layer .lparam{font-family:var(--mono);font-size:11px;color:var(--faint);min-width:78px}
+  .layer .lout{font-family:var(--mono);font-size:12px;color:var(--cyan);text-align:right;min-width:96px}
+  .arrow{color:var(--border2);font-size:16px;line-height:1.4;height:20px}
+  .group{width:100%;max-width:600px;border:1px dashed var(--border2);border-radius:12px;padding:16px;margin:0;background:rgba(45,212,191,.03)}
+  .group .gh{font-family:var(--mono);font-size:11px;letter-spacing:.06em;color:var(--cyan);text-transform:uppercase;text-align:center;margin-bottom:12px}
+  .group .flow .layer{max-width:520px}
+  .opt{border-style:dashed;opacity:.85}
+  .opt .lname::after{content:" · 可选降维";color:var(--orange);font-size:11px;font-weight:400}
+
+  .heads{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;width:100%;max-width:600px;margin-top:4px}
+  @media(max-width:620px){.heads{grid-template-columns:1fr}.layer{max-width:100%}}
+  .head{border-radius:11px;padding:14px;border:1px solid var(--border2);background:var(--card)}
+  .head .hn{font-weight:700;font-size:15px}
+  .head .ht{font-family:var(--mono);font-size:11px;color:var(--faint);margin:3px 0 9px}
+  .head .hstat{font-size:12px;font-weight:600;font-family:var(--mono);padding:3px 8px;border-radius:6px;display:inline-block}
+  .head .hnote{font-size:12px;color:var(--muted);margin-top:9px}
+  .head.on{border-color:var(--green);box-shadow:0 0 0 1px rgba(63,185,80,.25) inset}
+  .head.on .hstat{background:rgba(63,185,80,.16);color:var(--green)}
+  .head.off{opacity:.72}
+  .head.off .hstat{background:rgba(214,165,22,.14);color:var(--yellow)}
+  .head.dead .hstat{background:rgba(139,148,158,.16);color:var(--faint)}
+  .archnote{font-size:12.5px;color:var(--faint);margin-top:18px;text-align:center;font-family:var(--mono)}
+  .legend{display:flex;gap:18px;justify-content:center;flex-wrap:wrap;margin-top:14px;font-size:12px;color:var(--muted)}
+  .legend span{display:flex;align-items:center;gap:6px}
+  .sw{width:11px;height:11px;border-radius:3px}
+
+  /* decision table */
+  table{width:100%;border-collapse:collapse;margin-top:8px;font-size:14px}
+  th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--border)}
+  th{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--faint);font-weight:600}
+  td .k{font-weight:600}
+  td.r{color:var(--muted)}
+  tr:hover td{background:var(--card2)}
+
+  .note{background:rgba(240,136,62,.07);border:1px solid rgba(240,136,62,.3);border-radius:12px;padding:16px 18px;margin-top:18px;font-size:14px;color:#f3c9a6}
+  .note b{color:var(--orange)}
+  .safe{background:rgba(248,81,73,.06);border:1px solid rgba(248,81,73,.28);border-radius:12px;padding:16px 18px;font-size:14px;color:#f5b5b1}
+  .safe b{color:var(--red)}
+
+  footer{margin-top:80px;padding-top:24px;border-top:1px solid var(--border);color:var(--faint);font-size:13px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ===================== HERO ===================== -->
+  <header class="hero">
+    <div class="eyebrow">Autonomous Person-Following · Research Plan</div>
+    <h1>视觉跟随自动驾驶<br>实验计划路线图</h1>
+    <p class="sub">从「YOLO + 规则跟随」到「端到端深度模型」再到「VLA 语义跟随」—— 三阶段递进,基于车载 Jetson + 双目相机 + CAN 平台。</p>
+    <div class="chips">
+      <span class="chip">平台 <b>Jetson AGX Xavier</b></span>
+      <span class="chip">感知 <b>ZKHY 双目</b></span>
+      <span class="chip">控制 <b>CAN / SocketCAN</b></span>
+      <span class="chip">检测 <b>YOLO11n + TensorRT</b></span>
+      <span class="chip">学习 <b>CNN+GRU → VLA</b></span>
+    </div>
+    <div class="progress">
+      <div class="pstep active"><div class="pnum">PHASE 1</div><div class="pname">YOLO + 规则跟随</div><div class="pstat"><span class="dot b"></span>进行中</div></div>
+      <div class="pstep"><div class="pnum">PHASE 2</div><div class="pname">端到端深度模型</div><div class="pstat"><span class="dot g"></span>计划中</div></div>
+      <div class="pstep"><div class="pnum">PHASE 3</div><div class="pname">VLA 语义跟随</div><div class="pstat"><span class="dot g"></span>探索</div></div>
+    </div>
+  </header>
+
+  <!-- ===================== 现状 ===================== -->
+  <section>
+    <div class="stag">Status Quo</div>
+    <h2>项目现状</h2>
+    <p class="lead">数据采集与规则验证已打通,当前推进重点是把规则跟随在车上跑成实时闭环。</p>
+    <div class="grid g3">
+      <div class="card">
+        <h3>✅ 已完成</h3>
+        <ul>
+          <li>Phase1 采集服务(相机 ROS + CAN,web :8080)</li>
+          <li>CAN 解码:fr 协议扒回,车速/转向/里程已验证</li>
+          <li>规则跟随控制器离线仿真(run_004)</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>🔧 进行中</h3>
+        <ul>
+          <li>YOLO 车载部署:yolo11n → TensorRT FP16</li>
+          <li>求 Xavier 上 15–30 fps 实时检测</li>
+          <li>重新采集多场景数据(扩数据集)</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>🛡️ 安全底线</h3>
+        <ul>
+          <li>默认只监听 CAN,绝不发帧</li>
+          <li>控车为最后阶段,需安全护栏</li>
+          <li>每步上车前需人工确认</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== 数据洞察 ===================== -->
+  <section>
+    <div class="stag">Data-Driven Findings</div>
+    <h2>关键数据洞察</h2>
+    <p class="lead">基于 run_004 的 <b>5904 帧</b>图像–底盘对齐分析。这三条结论直接决定了 Phase 2 的模型该学什么、不该学什么。</p>
+    <div class="grid g3">
+      <div class="metric good">
+        <div class="big">r = −0.53</div>
+        <div class="lbl">人在画面左右位置 ↔ 转向</div>
+        <div class="desc">可解释约 <b>28%</b> 的转向方差(单特征,CNN 能挖更多)。</div>
+        <div class="verdict v-good">转向 = 强信号 → 端到端主攻</div>
+      </div>
+      <div class="metric bad">
+        <div class="big">r = −0.14</div>
+        <div class="lbl">人框高/距离 ↔ 速度</div>
+        <div class="desc">速度近似常数 <b>0.6 m/s</b>(62.5% 的帧速度几乎不变),端到端理论上限只能解释 ~2% 方差。</div>
+        <div class="verdict v-bad">速度学不出 → 写死 + 规则</div>
+      </div>
+      <div class="metric warn">
+        <div class="big">4.3%</div>
+        <div class="lbl">停车帧占比(256 / 5904)</div>
+        <div class="desc">0 帧因丢框而停;停车段多为首尾起步/收尾 artifact + 中段费解停车,正样本又少又脏。</div>
+        <div class="verdict v-warn">停车走规则 → go/stop 头留 v2</div>
+      </div>
+    </div>
+    <div class="note">
+      <b>结论(本次定调):</b> Phase 2 第一版只让网络学 <b>转向(ω)</b>;<b>速度写死</b>巡航值 + 目标距离微调;<b>停车交给规则</b>(丢框 / 人过近)硬触发。"前进与否"分类头作为 v2,等采到能解释"为什么停"的干净数据再上。
+    </div>
+  </section>
+
+  <!-- ===================== 路线图 ===================== -->
+  <section>
+    <div class="stag">Roadmap</div>
+    <h2>三阶段实验计划</h2>
+    <p class="lead">每阶段都产出一个可上车验证的成果,且为下一阶段提供数据与基线对照。</p>
+
+    <!-- PHASE 1 -->
+    <div class="phase ph1">
+      <div class="pin">1</div>
+      <div class="ptitle">YOLO 人体识别 + 程序控制跟随 <span class="badge b-now">进行中 · 主线</span></div>
+      <p class="pgoal">车上实时检测人 → 规则算转向/速度 → 自动跟随。先纯感知(不控车),再跨安全线发 CAN 控车。这是整个项目的地基,也是 Phase 2 的数据来源和性能基线。</p>
+      <div class="pbody">
+        <h4>关键任务</h4>
+        <ul>
+          <li>YOLO 车载部署 <span class="why">— yolo11n → ONNX → TensorRT FP16,在 Xavier 求 15–30 fps</span></li>
+          <li>实时感知链路 <span class="why">— 订阅相机 ROS 话题,逐帧检测人、选最大框为目标</span></li>
+          <li>规则控制律 <span class="why">— 转向 steer = Kp·(cx/W − 0.5);速度 = 固定巡航 + 框高 P 控制;丢框/过近 → 停</span></li>
+          <li>CAN 控车(跨安全线)<span class="why">— ctrl_cmd_98c4d2d0,转向取负,SocketCAN 发 can0,安全护栏 + 人工点头</span></li>
+        </ul>
+        <h4>产出</h4>
+        <ul><li>车上实时自动跟随 demo + 一套可复用的规则基线</li></ul>
+        <h4>技术栈</h4>
+        <div class="tstack"><span>YOLO11n</span><span>TensorRT</span><span>ROS / rospy</span><span>OpenCV</span><span>python-can</span><span>SocketCAN</span></div>
+      </div>
+      <div class="safe"><b>安全:</b> 控车前 allow_can_send 默认 false;先在仿真/架空轮验证编码正确,再低速、近距、可一键断电的条件下试控。</div>
+    </div>
+
+    <!-- PHASE 2 -->
+    <div class="phase ph2">
+      <div class="pin">2</div>
+      <div class="ptitle">端到端深度跟随模型 <span class="badge b-next">下一步 · 本次重点</span></div>
+      <p class="pgoal">用 5 帧图像序列直接回归控制量,跳过手写规则。模仿学习(behavior cloning),以 Phase 1 的规则输出 / 人遥控真值为 teacher。架构见下。</p>
+
+      <!-- 架构图 -->
+      <div class="arch">
+        <div class="arch-io">输入序列 · 5 frames <b>[t-4, t-3, t-2, t-1, t]</b> · 每帧 <b>160×120×3</b> RGB</div>
+        <div class="flow">
+          <div class="arrow">↓</div>
+          <div class="group">
+            <div class="gh">Shared CNN Backbone · 每帧共享同一套权重 (PilotNet 风格)</div>
+            <div class="flow">
+              <div class="layer"><span class="lparam">5×5 · s2</span><span class="lname">Conv2D 24</span><span class="lout">58×78×24</span></div>
+              <div class="arrow">↓</div>
+              <div class="layer"><span class="lparam">5×5 · s2</span><span class="lname">Conv2D 36</span><span class="lout">27×37×36</span></div>
+              <div class="arrow">↓</div>
+              <div class="layer"><span class="lparam">5×5 · s2</span><span class="lname">Conv2D 48</span><span class="lout">12×17×48</span></div>
+              <div class="arrow">↓</div>
+              <div class="layer"><span class="lparam">3×3 · s1</span><span class="lname">Conv2D 64</span><span class="lout">10×15×64</span></div>
+              <div class="arrow">↓</div>
+              <div class="layer"><span class="lparam">3×3 · s1</span><span class="lname">Conv2D 64</span><span class="lout">8×13×64</span></div>
+              <div class="arrow">↓</div>
+              <div class="layer"><span class="lparam">flatten</span><span class="lname">Feature Vector</span><span class="lout">6656</span></div>
+            </div>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="layer opt"><span class="lparam">FC + ReLU</span><span class="lname">降维投影</span><span class="lout">→ 256</span></div>
+          <div class="arrow">↓</div>
+          <div class="arch-io" style="margin:2px 0">每帧一个特征向量 × 5 个时间步</div>
+          <div class="arrow">↓</div>
+          <div class="layer"><span class="lparam">temporal</span><span class="lname">GRU (hidden 128)</span><span class="lout">序列建模</span></div>
+          <div class="arrow">↓</div>
+          <div class="layer"><span class="lparam">last step</span><span class="lname">Last Hidden State</span><span class="lout">128</span></div>
+          <div class="arrow">↓</div>
+          <div class="layer"><span class="lparam">FC + ReLU</span><span class="lname">FC 128 (+dropout)</span><span class="lout">128</span></div>
+          <div class="arrow">↓</div>
+          <div class="heads">
+            <div class="head on">
+              <div class="hn">ω · 转向</div>
+              <div class="ht">回归 · 1</div>
+              <div class="hstat">v1 主学</div>
+              <div class="hnote">信号强 (r=−0.53),第一版唯一要学的量。</div>
+            </div>
+            <div class="head dead">
+              <div class="hn">v · 速度</div>
+              <div class="ht">回归 · 1</div>
+              <div class="hstat">v1 不学</div>
+              <div class="hnote">代码写死巡航 ≈0.6 + 框高 P 微调;学不出(r=−0.14)。</div>
+            </div>
+            <div class="head off">
+              <div class="hn">stop · 前进与否</div>
+              <div class="ht">二分类 · 1</div>
+              <div class="hstat">v2 再上</div>
+              <div class="hnote">当前正样本不足且脏;v1 先用规则停。</div>
+            </div>
+          </div>
+        </div>
+        <div class="legend">
+          <span><span class="sw" style="background:var(--green)"></span>v1 启用并训练</span>
+          <span><span class="sw" style="background:var(--faint)"></span>v1 规则代替,不训</span>
+          <span><span class="sw" style="background:var(--yellow)"></span>v2 启用</span>
+          <span><span class="sw" style="background:var(--orange);border:1px dashed #fff"></span>可选优化层</span>
+        </div>
+        <div class="archnote">参数量 ≈ 2.7M(GRU 是大头);加可选 6656→256 降维投影后,GRU 参数从 ~2.6M 降到 ~0.3M。卷积输出按 valid padding 计算。</div>
+      </div>
+
+      <div class="pbody" style="margin-top:18px">
+        <h4>数据采集要求(重新采集,补当前数据集短板)</h4>
+        <ul>
+          <li>多样性 <span class="why">— 多路线 / 多光照 / 多人物 / 多衣着,目标 30–60 min,分多段 3–5 min/run</span></li>
+          <li>制造速度信号 <span class="why">— 司机刻意随距离变速(人远了加速追、近了减速),否则速度永远是常数、学不出</span></li>
+          <li>制造干净停车 <span class="why">— 让人主动停下 / 走到障碍后,司机随之停,形成"画面有线索 → 停"的因果对(为 v2 的 go/stop 头备料)</span></li>
+          <li>裁掉首尾 <span class="why">— 每个 run 去掉起步前、收尾后的 artifact 段,避免污染标签</span></li>
+          <li>双目视差(可选)<span class="why">— 给目标真实距离(米),替代不可靠的框高,让速度/停车有物理依据</span></li>
+        </ul>
+        <h4>训练设置</h4>
+        <ul>
+          <li>验证集 <span class="why">— 按 run / 按时间段切分,严禁随机切(相邻帧泄漏会让指标虚高)</span></li>
+          <li>预处理 <span class="why">— 1280×720 按比例 crop 后 resize,避免压扁;按固定时间间隔重采样 5 帧序列</span></li>
+          <li>正则 <span class="why">— 数据量小,缩小通道 / dropout / 数据增强(水平翻转须同步翻转转向符号)</span></li>
+          <li>评估 <span class="why">— 转向预测 vs 真值曲线 + 接入现有 follow_sim 做闭环回放;stop 看 recall 而非准确率</span></li>
+        </ul>
+        <h4>技术栈</h4>
+        <div class="tstack"><span>PyTorch</span><span>CNN + GRU</span><span>Behavior Cloning</span><span>TensorRT(部署)</span></div>
+      </div>
+    </div>
+
+    <!-- PHASE 3 -->
+    <div class="phase ph3">
+      <div class="pin">3</div>
+      <div class="ptitle">VLA 语义跟随 <span class="badge b-explore">探索</span></div>
+      <p class="pgoal">从"跟最大框"升级到可用语言指令驱动的语义跟随:"跟着穿红衣服的人""到路口停下""慢一点跟"。Vision-Language-Action 把感知–推理–控制端到端打通。</p>
+      <div class="pbody">
+        <h4>方向</h4>
+        <ul>
+          <li>候选模型 <span class="why">— OpenVLA、π0 (Physical Intelligence)、RT-2 类,或 TinyVLA / 小型可蒸馏 VLA</span></li>
+          <li>价值 <span class="why">— 自然语言指令、零样本泛化到新目标、理解场景语义,超越几何跟随</span></li>
+          <li>落地路径 <span class="why">— 先云端/离线验证可行性,再考虑量化 + 蒸馏塞进 Xavier,或边缘–云协同</span></li>
+        </ul>
+        <h4>主要挑战</h4>
+        <ul>
+          <li>算力 <span class="why">— Xavier (~32 TOPS) 跑不动 7B 级 VLA 实时,必须裁剪/量化或下放算力</span></li>
+          <li>数据 <span class="why">— 需要带语言标注的 (指令, 图像, 动作) 三元组,采集与标注成本高</span></li>
+        </ul>
+        <div class="tstack"><span>OpenVLA / π0</span><span>VLM</span><span>量化 / 蒸馏</span><span>Instruction Tuning</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== 决策记录 ===================== -->
+  <section>
+    <div class="stag">Decision Log</div>
+    <h2>关键决策记录</h2>
+    <p class="lead">本次讨论(2026-06-28)定下的几条,均有数据支撑。</p>
+    <table>
+      <thead><tr><th>决策</th><th>理由</th><th>依据</th></tr></thead>
+      <tbody>
+        <tr><td><span class="k">速度写死,不端到端学</span></td><td class="r">速度近似常数,视觉无信号</td><td class="r">box_h↔vel r=−0.14,R²~2%</td></tr>
+        <tr><td><span class="k">第一版只学转向(单头)</span></td><td class="r">唯一信号强、可学好的量</td><td class="r">offset↔steer r=−0.53,R²~28%</td></tr>
+        <tr><td><span class="k">停车交给规则,go/stop 头留 v2</span></td><td class="r">正样本仅 4.3% 且多为 artifact</td><td class="r">256 停车帧,0 丢框,首尾集中</td></tr>
+        <tr><td><span class="k">重新采集多场景数据</span></td><td class="r">现数据单场景、量小、速度无变化</td><td class="r">仅 run_004 一条 368m/~10min</td></tr>
+        <tr><td><span class="k">验证集按 run/时间切分</span></td><td class="r">相邻帧高度冗余,随机切会泄漏</td><td class="r">6–9 fps,相邻帧近乎相同</td></tr>
+        <tr><td><span class="k">转向上车映射须取负</span></td><td class="r">fr 协议「负=右转」与控制器相反</td><td class="r">align 验证 r≈−0.52 方向反</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <footer>
+    <span>视觉跟随自动驾驶 · 实验计划 v1</span>
+    <span>更新于 2026-06-28 · follow_data</span>
+  </footer>
+
+</div>
+<script>
+  const io=new IntersectionObserver((es)=>es.forEach(e=>{if(e.isIntersecting)e.target.classList.add('in')}),{threshold:.08});
+  document.querySelectorAll('section').forEach(s=>io.observe(s));
+</script>
+</body>
+</html>

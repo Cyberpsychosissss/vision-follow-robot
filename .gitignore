@@ -1,0 +1,17 @@
+# 默认忽略顶层一切, 只跟踪下面 ! 放行的项 ----------------------------
+/*
+
+!/.gitignore
+!/README.md
+!/code
+!/follow_data_collector
+!/experiment_plan.html
+!/todo.html
+
+# 即便在已放行目录内, 这些也不跟踪 --------------------------------------
+**/.DS_Store
+**/__pycache__/
+**/*.py[cod]
+
+# 说明: 两篇 PDF 文档含车内网IP+登录密码, 故不跟踪(敏感);
+#       大体积素材(*.mp4 / *.onnx / dataset/ / *.csv 等)也不跟踪。

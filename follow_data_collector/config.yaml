@@ -1,0 +1,60 @@
+# ============================================================
+# follow_data_collector - configuration
+# Phase 1: LISTEN-ONLY data collection (no vehicle control).
+# The vehicle is driven manually by a human with a remote.
+# This tool ONLY records data. It never sends CAN frames.
+# ============================================================
+
+camera:
+  source: 0              # 0 / 1 (USB), or "rtsp://...", "http://...", or a GStreamer pipeline string
+  fps: 10                # target SAVE fps (frames written to disk per second)
+  width: 1280            # requested capture width
+  height: 720            # requested capture height
+  jpeg_quality: 90       # 0-100, higher = better quality / larger files
+  show_preview: true     # show a live OpenCV preview window with overlay
+  reconnect_attempts: 5  # how many times to retry opening the camera before giving up
+  max_consecutive_read_failures: 30  # stop capture only after this many failures in a row
+
+can:
+  enabled: true
+  channel: can0
+  bitrate: 500000
+  interface: socketcan
+  listen_only: true      # SAFETY: receive-only. The code never calls bus.send().
+  no_message_warn_sec: 5 # warn if no CAN frame received for this many seconds
+
+dataset:
+  root_dir: ./dataset
+  session_name: follow_001
+  default_scenario: straight_follow
+  # preset scenario labels cycled with the 's' key during capture
+  scenarios:
+    - straight_follow
+    - left_turn
+    - right_turn
+    - person_stop
+    - person_lost
+    - multi_person
+    - no_person
+
+logging:
+  level: INFO            # INFO or DEBUG (DEBUG logs per-second FPS / CAN rate / queue depth)
+
+runtime:
+  countdown_sec: 3       # countdown before capture starts
+  status_print_sec: 5    # terminal status heartbeat interval (fallback when rich is unavailable)
+  camera_queue_max: 8    # max frames buffered between capture and writer
+  writer_queue_max: 256  # max images queued for the disk writer
+  disk_low_gb: 5         # warn when free disk space drops below this many GB
+
+safety:
+  allow_can_send: false       # MUST stay false in phase 1. Guards every CAN write path.
+  require_manual_remote: true # operator must hold the remote, ready to emergency-stop
+
+web:
+  enabled: false   # local browser dashboard (no extra dependencies, stdlib only)
+  host: 0.0.0.0    # bind address; use 127.0.0.1 to restrict to the local machine
+  port: 8080       # open http://<工控机IP>:8080 from a laptop on the same network
+  # NOTE: the web UI control buttons (start/stop/pause/marker/scenario) only
+  # control THIS data collector. They never send CAN frames or touch the vehicle.
+

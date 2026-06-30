@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>视觉跟随自动驾驶 · TODO</title>
+<style>
+  :root{
+    --bg:#0a0e14; --card:#141a22; --card2:#11161d; --border:#232b36; --border2:#2d3744;
+    --text:#e6edf3; --muted:#8b949e; --faint:#6b7585;
+    --cyan:#2dd4bf; --blue:#60a5fa; --purple:#a78bfa;
+    --green:#3fb950; --yellow:#d6a516; --red:#f85149; --orange:#f0883e;
+    --mono:"SF Mono","JetBrains Mono","Fira Code",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    background:radial-gradient(1100px 560px at 75% -10%,#10212b 0%,var(--bg) 55%) fixed,var(--bg);
+    color:var(--text);line-height:1.6;padding:0 20px 100px;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:880px;margin:0 auto}
+  a{color:var(--cyan);text-decoration:none}
+  .back{display:inline-block;font-size:13px;color:var(--muted);margin:26px 0 0}
+  .back:hover{color:var(--cyan)}
+
+  header{padding:14px 0 26px;border-bottom:1px solid var(--border);margin-bottom:8px}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.2em;color:var(--cyan);text-transform:uppercase;margin-bottom:12px}
+  h1{font-size:32px;font-weight:800;letter-spacing:-.01em}
+  .barwrap{margin-top:22px;display:flex;align-items:center;gap:16px}
+  .bar{flex:1;height:10px;background:var(--card2);border:1px solid var(--border);border-radius:20px;overflow:hidden}
+  .bar i{display:block;height:100%;width:0;border-radius:20px;background:linear-gradient(90deg,var(--cyan),var(--blue));transition:width .5s cubic-bezier(.2,.7,.2,1)}
+  .barnum{font-family:var(--mono);font-size:14px;color:var(--muted);white-space:nowrap}
+  .barnum b{color:var(--text);font-size:18px}
+
+  .group{margin-top:30px}
+  .ghead{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+  .gtitle{font-size:18px;font-weight:750}
+  .gtag{font-family:var(--mono);font-size:11px;padding:3px 9px;border-radius:20px;font-weight:600}
+  .t-now{background:rgba(96,165,250,.16);color:var(--blue);border:1px solid rgba(96,165,250,.4)}
+  .t-next{background:rgba(45,212,191,.14);color:var(--cyan);border:1px solid rgba(45,212,191,.35)}
+  .t-explore{background:rgba(167,139,250,.14);color:var(--purple);border:1px solid rgba(167,139,250,.35)}
+  .t-key{background:rgba(240,136,62,.16);color:var(--orange);border:1px solid rgba(240,136,62,.45)}
+  .gcount{margin-left:auto;font-family:var(--mono);font-size:12px;color:var(--faint)}
+  .gline{height:3px;border-radius:3px;background:var(--border);margin-bottom:10px;overflow:hidden}
+  .gline i{display:block;height:100%;width:0;transition:width .5s}
+  .ph1 .gline i{background:var(--blue)} .key .gline i{background:var(--orange)}
+  .ph2 .gline i{background:var(--cyan)} .ph3 .gline i{background:var(--purple)}
+
+  .task{display:flex;align-items:flex-start;gap:12px;padding:12px 14px;border:1px solid var(--border);
+    border-radius:11px;background:var(--card);margin:8px 0;cursor:pointer;transition:.15s;user-select:none}
+  .task:hover{border-color:var(--border2);background:var(--card2)}
+  .task input{appearance:none;-webkit-appearance:none;flex:none;width:20px;height:20px;margin-top:1px;
+    border:2px solid var(--border2);border-radius:6px;cursor:pointer;position:relative;transition:.15s}
+  .task input:checked{background:var(--green);border-color:var(--green)}
+  .task input:checked::after{content:"✓";position:absolute;inset:0;display:grid;place-items:center;color:#0a0e14;font-size:13px;font-weight:900}
+  .tx{flex:1;font-size:15px}
+  .tx .why{display:block;color:var(--faint);font-size:13px;margin-top:2px}
+  .task input:checked ~ .tx{color:var(--faint);text-decoration:line-through;text-decoration-color:var(--border2)}
+  .task input:checked ~ .tx .why{text-decoration:none}
+  .star{border-color:rgba(240,136,62,.5);background:linear-gradient(180deg,rgba(240,136,62,.07),var(--card))}
+  .pill{flex:none;font-family:var(--mono);font-size:10px;padding:3px 8px;border-radius:20px;margin-top:2px;font-weight:600}
+  .p-now{background:rgba(96,165,250,.16);color:var(--blue)}
+  .p-block{background:rgba(248,81,73,.14);color:var(--red)}
+  .p-star{background:rgba(240,136,62,.18);color:var(--orange)}
+  .p-v2{background:rgba(139,148,158,.16);color:var(--faint)}
+
+  .tools{margin-top:36px;display:flex;gap:10px;align-items:center}
+  .btn{font-family:var(--mono);font-size:12px;padding:7px 14px;border:1px solid var(--border2);border-radius:8px;
+    background:var(--card2);color:var(--muted);cursor:pointer;transition:.15s}
+  .btn:hover{border-color:var(--red);color:var(--red)}
+  .savednote{font-size:12px;color:var(--faint)}
+  footer{margin-top:40px;color:var(--faint);font-size:12px}
+  @media(max-width:560px){h1{font-size:26px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="experiment_plan.html">← 返回实验计划</a>
+  <header>
+    <div class="eyebrow">Task Board · 视觉跟随自动驾驶</div>
+    <h1>TODO 清单</h1>
+    <div class="barwrap">
+      <div class="bar"><i id="globalbar"></i></div>
+      <div class="barnum"><b id="done">0</b> / <span id="total">0</span> 完成</div>
+    </div>
+  </header>
+
+  <!-- ===== Phase 1 ===== -->
+  <div class="group ph1" data-group>
+    <div class="ghead"><span class="gtitle">阶段一 · YOLO + 规则跟随</span><span class="gtag t-now">进行中</span><span class="gcount"></span></div>
+    <div class="gline"><i></i></div>
+    <label class="task" data-id="p1-onnx"><input type="checkbox" checked><span class="tx">yolo11n → ONNX 导出<span class="why">opset11,在 4090 导,已在桌面 yolo11n.onnx</span></span></label>
+    <label class="task" data-id="p1-container"><input type="checkbox" checked><span class="tx">建专属隔离容器 follow_surf2026<span class="why">多人共享车的正解,容器内 CUDA10/TRT6/g++4.8 齐全</span></span></label>
+    <label class="task" data-id="p1-backend"><input type="checkbox"><span class="tx">容器内装 CUDA10 检测后端跑 yolo11n<span class="why">优先 onnxruntime;否则 tensorrtx 复用 TRT6 C++ 绕开 ONNX 解析器</span></span><span class="pill p-now">进行中</span></label>
+    <label class="task" data-id="p1-fps"><input type="checkbox"><span class="tx">实测 Xavier 上 yolo11n FPS<span class="why">相机 ~9.5fps,目标 15–30 够用</span></span></label>
+    <label class="task" data-id="p1-ros"><input type="checkbox"><span class="tx">接相机 ROS 话题做实时人体检测<span class="why">逐帧检测、选最大框为跟随目标</span></span></label>
+    <label class="task" data-id="p1-rule"><input type="checkbox"><span class="tx">实现规则控制律<span class="why">转向 Kp·(cx/W−0.5);速度 固定巡航 + 框高 P;丢框/过近 → 停</span></span></label>
+    <label class="task" data-id="p1-simlive"><input type="checkbox"><span class="tx">车上实时跟随验证(仍不控车)<span class="why">先纯感知闭环,确认决策合理</span></span></label>
+    <label class="task" data-id="p1-can"><input type="checkbox"><span class="tx">CAN 控车(跨安全线)<span class="why">ctrl_cmd_98c4d2d0,转向取负,SocketCAN 发 can0,安全护栏 + 人工点头</span></span><span class="pill p-block">需点头</span></label>
+  </div>
+
+  <!-- ===== 感知数据基建 (重点) ===== -->
+  <div class="group key" data-group>
+    <div class="ghead"><span class="gtitle">感知数据基建 ⭐</span><span class="gtag t-key">本次新增重点</span><span class="gcount"></span></div>
+    <div class="gline"><i></i></div>
+    <label class="task star" data-id="inf-disp"><input type="checkbox"><span class="tx">⭐ 获取双目<b>视差图</b>(disparity → 真实距离米)<span class="why">解决"框高测距不准、速度/停车无物理依据"(box_h↔vel r=−0.14);是速度/停车头能上的前提</span></span><span class="pill p-star">关键</span></label>
+    <label class="task star" data-id="inf-obs"><input type="checkbox"><span class="tx">⭐ 获取<b>障碍物图</b>(obstacle map)<span class="why">避障 + 可靠安全停;相机话题 /apollo/sensor/camera/obstacle/front_6mm</span></span><span class="pill p-star">关键</span></label>
+    <label class="task" data-id="inf-driver"><input type="checkbox"><span class="tx">攻克卡点:ZKHY 私有协议 / 改驱动源码重编<span class="why">视差/右目重编卡 GCC4.8 vs cxx11 ABI,之前暂缓</span></span><span class="pill p-block">阻塞</span></label>
+    <label class="task" data-id="inf-decode"><input type="checkbox" checked><span class="tx">CAN 解码 + 图像-底盘时间戳对齐<span class="why">fr 协议已扒回,decode → chassis.csv → (image,speed,steering)</span></span></label>
+  </div>
+
+  <!-- ===== Phase 2 ===== -->
+  <div class="group ph2" data-group>
+    <div class="ghead"><span class="gtitle">阶段二 · 端到端 CNN+GRU</span><span class="gtag t-next">下一步</span><span class="gcount"></span></div>
+    <div class="gline"><i></i></div>
+    <label class="task" data-id="p2-plan"><input type="checkbox" checked><span class="tx">实验计划 + 架构设计 + 数据可学性分析<span class="why">转向 r=−0.53 可学 / 速度 r=−0.14 写死 / 停车走规则,见 experiment_plan.html</span></span></label>
+    <label class="task" data-id="p2-collect"><input type="checkbox"><span class="tx">重新采集多场景数据<span class="why">多路线/光照/人物,30–60min,分多段 3–5min/run</span></span></label>
+    <label class="task" data-id="p2-vary"><input type="checkbox"><span class="tx">采集时刻意随距离变速<span class="why">人远了加速、近了减速,否则速度恒定学不出</span></span></label>
+    <label class="task" data-id="p2-stopdata"><input type="checkbox"><span class="tx">制造干净停车样本<span class="why">人主动停/障碍后停,为 v2 的 go/stop 头备料,裁掉每 run 首尾</span></span></label>
+    <label class="task" data-id="p2-run003"><input type="checkbox"><span class="tx">run_003 解码对齐,扩充数据集<span class="why">现仅 run_004 单场景,加 run_003 ~1211 帧</span></span></label>
+    <label class="task" data-id="p2-pipe"><input type="checkbox"><span class="tx">搭 PyTorch 转向单头训练管线<span class="why">共享 CNN+GRU,按 run 切分、时序重采样、增强、过拟合监控</span></span><span class="pill p-now">可先做</span></label>
+    <label class="task" data-id="p2-train"><input type="checkbox"><span class="tx">训练 baseline + 评估转向可学性<span class="why">转向预测 vs 真值曲线 + 接 follow_sim 闭环回放</span></span></label>
+    <label class="task" data-id="p2-headv2"><input type="checkbox"><span class="tx">(v2) 速度 / go-stop 头<span class="why">等视差图给真实距离 + 采到干净停车样本后再上</span></span><span class="pill p-v2">v2</span></label>
+    <label class="task" data-id="p2-deploy"><input type="checkbox"><span class="tx">模型部署到 Xavier(TensorRT)<span class="why">小网络 ~2.7M(降维后更小),量化后实时</span></span></label>
+  </div>
+
+  <!-- ===== Phase 3 ===== -->
+  <div class="group ph3" data-group>
+    <div class="ghead"><span class="gtitle">阶段三 · VLA 语义跟随</span><span class="gtag t-explore">探索</span><span class="gcount"></span></div>
+    <div class="gline"><i></i></div>
+    <label class="task" data-id="p3-survey"><input type="checkbox"><span class="tx">调研候选 VLA<span class="why">OpenVLA / π0 (Physical Intelligence) / TinyVLA</span></span></label>
+    <label class="task" data-id="p3-compute"><input type="checkbox"><span class="tx">评估 Xavier 算力可行性<span class="why">~32 TOPS 跑不动 7B 级,需量化/蒸馏或边缘-云协同</span></span></label>
+    <label class="task" data-id="p3-data"><input type="checkbox"><span class="tx">采集带语言指令的数据<span class="why">(指令, 图像, 动作) 三元组,如"跟着穿红衣服的人""路口停下"</span></span></label>
+  </div>
+
+  <div class="tools">
+    <button class="btn" id="reset">重置全部</button>
+    <span class="savednote">✓ 勾选状态自动保存在本浏览器</span>
+  </div>
+  <footer>视觉跟随自动驾驶 · TODO · 2026-06-28 · follow_data</footer>
+</div>
+
+<script>
+  const KEY = id => "followtodo_" + id;
+  const tasks = [...document.querySelectorAll('.task')];
+
+  function load(){
+    tasks.forEach(t=>{
+      const id = t.dataset.id, box = t.querySelector('input');
+      const saved = localStorage.getItem(KEY(id));
+      if(saved !== null) box.checked = (saved === '1');   // 否则保留 HTML 默认(已完成项)
+    });
+  }
+  function update(){
+    let gdone=0;
+    tasks.forEach(t=>{ if(t.querySelector('input').checked) gdone++; });
+    const total = tasks.length;
+    document.getElementById('done').textContent = gdone;
+    document.getElementById('total').textContent = total;
+    document.getElementById('globalbar').style.width = (gdone/total*100)+'%';
+    // 每组
+    document.querySelectorAll('[data-group]').forEach(g=>{
+      const ts = [...g.querySelectorAll('.task input')];
+      const d = ts.filter(b=>b.checked).length;
+      g.querySelector('.gcount').textContent = d+' / '+ts.length;
+      g.querySelector('.gline i').style.width = (d/ts.length*100)+'%';
+    });
+  }
+  tasks.forEach(t=>{
+    const box = t.querySelector('input'), id = t.dataset.id;
+    box.addEventListener('change', ()=>{ localStorage.setItem(KEY(id), box.checked?'1':'0'); update(); });
+  });
+  document.getElementById('reset').addEventListener('click', ()=>{
+    if(!confirm('清空所有勾选状态?')) return;
+    tasks.forEach(t=>localStorage.removeItem(KEY(t.dataset.id)));
+    location.reload();
+  });
+  load(); update();
+</script>
+</body>
+</html>
