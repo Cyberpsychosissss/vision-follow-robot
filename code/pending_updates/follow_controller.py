@@ -46,19 +46,24 @@ KSTEER_OFFX = 60.0         # 转向增益(YOLO 归一 off_x → 度)
 STEER_DEADZONE_DEG = 1.5   # 方位角死区(度), 内不转
 TARGET_TIMEOUT = 0.6       # s  target.json 超过这么旧就当丢目标(5fps下留~3帧余量)
 LOST_HOLD = 0.0            # 丢目标时车速(0=停)
-LOOP_HZ = 20.0
+LOOP_HZ = 40.0             # 控制频率。信息瓶颈在相机~9fps, 提这个只降低指令延迟+让斜坡更细腻;
+                           # CAN 发帧恒 50Hz(fr 协议 20ms 周期, 在 car_control 里, 别动)
 
 # ---- 平滑参数(解决"一冲一停"顿挫, 核心改动) ----
 # ① 连续斜坡(取代死区 bang-bang): 不再"4m内全停", 而是向中心距收敛, 速度随距离平滑增减
 DIST_CENTER  = (DESIRED_MIN + DESIRED_MAX) / 2.0  # m  目标保持在中心(=3.0), 自然落在 2~4 带内
 HOLD_BAND    = 0.30        # m  中心±此值内不前进(防在设定点反复抽动)
 # ② 一阶低通(EMA): 压视差距离/横向的逐帧抖动. 越小越平滑但越迟钝
-DIST_EMA     = 0.40        # 新值权重(0~1): dist_filt = 0.4*新 + 0.6*旧
-LAT_EMA      = 0.40
-# ③ slew 限幅: 每控制周期(1/20s)速度/转向最大变化量, 防 0→0.4 一步到位的顿挫
-MAX_DSPEED_UP   = 0.030    # m/s 每周期(≈0.6 m/s² 加速), 0→限速约需0.7s
-MAX_DSPEED_DOWN = 0.080    # m/s 每周期(减速更快, 安全优先)
-MAX_DSTEER      = 4.0      # 度 每周期(≈80°/s 转向变化上限)
+#    只在 target.json 出新样本时滤一次(与 LOOP_HZ 解耦); 0.60 ≈ 旧版 0.40@20Hz 的等效手感
+DIST_EMA     = 0.60        # 新值权重(0~1): dist_filt = 0.6*新 + 0.4*旧
+LAT_EMA      = 0.60
+# ③ slew 限幅: 用物理单位定义(不随 LOOP_HZ 变), 每周期步长运行时换算
+ACCEL_UP     = 0.6         # m/s²  加速上限(0→0.4 约 0.7s)
+ACCEL_DOWN   = 1.6         # m/s²  减速上限(安全优先, 停得更快)
+STEER_RATE   = 80.0        # °/s   转向变化率上限
+MAX_DSPEED_UP   = ACCEL_UP / LOOP_HZ      # m/s 每周期
+MAX_DSPEED_DOWN = ACCEL_DOWN / LOOP_HZ
+MAX_DSTEER      = STEER_RATE / LOOP_HZ    # 度 每周期
 # ④ 丢帧宽限: 短暂丢目标时保持上次转向+缓减速, 别立刻急停打嗝
 LOST_GRACE   = 0.40        # s  这段时间内按"滑行"处理, 超过才 SEARCH 硬停
 
@@ -86,16 +91,31 @@ def _slew(prev, target, up, down):
     return prev + d
 
 
-def read_desired():
-    """从 runtime/follow_config.json 读保持距离(web 可改, 热生效); 没有/非法返回 None。"""
+def read_config():
+    """读 runtime/follow_config.json(web 面板写, 热生效)。返回 dict, 没有/坏了返回空 dict。"""
     try:
         c = json.load(open(CONFIG_FILE))
-        mn, mx = float(c['desired_min']), float(c['desired_max'])
+        return c if isinstance(c, dict) else {}
+    except Exception:
+        return {}
+
+
+def apply_config(cfg, ctl):
+    """把面板配置热应用到控制律: 保持距离 + 最高速度(≤车控天花板 1.5)。"""
+    try:
+        mn, mx = float(cfg['desired_min']), float(cfg['desired_max'])
         if 0.3 < mn < mx < 20:
-            return mn, mx
+            globals()['DESIRED_MIN'], globals()['DESIRED_MAX'] = mn, mx
+            globals()['DIST_CENTER'] = (mn + mx) / 2.0
     except Exception:
         pass
-    return None
+    try:
+        ms = float(cfg['max_speed'])
+        if 0.05 <= ms <= ABS_MAX_SPEED:
+            globals()['MAX_SPEED'] = ms       # compute_cmd 的上限
+            ctl.max_speed = ms                # car_control 编码层的硬限(仍受 ABS_MAX_SPEED 兜底)
+    except Exception:
+        pass
 
 
 def read_target():
@@ -196,24 +216,28 @@ def main():
     last_log = 0.0
     # ---- 平滑状态(跨周期保持) ----
     f_dist = f_lat = None          # EMA 滤波后的距离/横向
+    last_tgt_ts = None             # 上次滤波的样本 ts(EMA 只对新样本滤一次)
     prev_speed = prev_steer = 0.0  # 上周期下发值(slew 用)
     last_valid_t = 0.0             # 上次有效目标时刻(丢帧宽限用)
     last_steer_cmd = 0.0           # 丢帧时保持的转向
     try:
         while True:
-            d = read_desired()                       # web 可热改保持距离
-            if d:
-                globals()['DESIRED_MIN'], globals()['DESIRED_MAX'] = d
-                globals()['DIST_CENTER'] = (d[0] + d[1]) / 2.0   # 中心距随之更新
+            apply_config(read_config(), ctl)         # web 可热改保持距离/最高速度
             t = read_target()
             now = time.time()
 
             if t is not None:
-                # ① EMA 低通: 压视差距离/横向的逐帧抖动, 再喂控制律
-                if t.get("dist_m") is not None:
-                    f_dist = _ema(f_dist, t["dist_m"], DIST_EMA); t["dist_m"] = f_dist
-                if t.get("lateral_m") is not None:
-                    f_lat = _ema(f_lat, t["lateral_m"], LAT_EMA); t["lateral_m"] = f_lat
+                # ① EMA 低通: 只在出"新样本"时滤一次(同一帧反复平均会让手感随 LOOP_HZ 漂移)
+                if t.get("ts") != last_tgt_ts:
+                    last_tgt_ts = t.get("ts")
+                    if t.get("dist_m") is not None:
+                        f_dist = _ema(f_dist, t["dist_m"], DIST_EMA)
+                    if t.get("lateral_m") is not None:
+                        f_lat = _ema(f_lat, t["lateral_m"], LAT_EMA)
+                if f_dist is not None:
+                    t["dist_m"] = f_dist
+                if f_lat is not None:
+                    t["lateral_m"] = f_lat
                 tgt_speed, tgt_steer, state = compute_cmd(t)
                 last_valid_t = now
                 last_steer_cmd = tgt_steer
@@ -245,6 +269,7 @@ def main():
                 "off_x": (round(t["off_x"], 3) if t and t.get("off_x") is not None else None),
                 "source": (t.get("source") if t else None),
                 "desired": [DESIRED_MIN, DESIRED_MAX],
+                "max_speed": round(MAX_SPEED, 2),
             }
             write_status(status)
             if now - last_log >= 1.0:

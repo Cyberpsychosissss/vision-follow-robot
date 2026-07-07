@@ -10,9 +10,9 @@
 | `code/` | **核心代码**,按 感知→检测→控制→编排 分层(详见 [`code/README.md`](code/README.md)) |
 | `code/perception/` | 双目采集 + 视差→真实米深度(`Z = focus×baseline/视差`) |
 | `code/detection/` | YOLOv5s(TensorRT FP16,~62fps)检人 → 挑目标 → 采深度 |
-| `code/control/` | 跟随控制律 + CAN 控车(硬限速 / 死人开关 / 默认 dry-run) |
-| `code/orchestration/` | 网页面板(启停感知与跟随 / 实时预览 / 录制) |
-| `code/pending_updates/` | 跟随平滑化新版(EMA 滤波 + 连续斜坡 + slew 限幅)+ 一键脚本 |
+| `code/control/` | 跟随控制律(EMA 平滑 + 连续斜坡 + slew 限幅)+ CAN 控车(硬限速 / 死人开关 / 默认 dry-run) |
+| `code/orchestration/` | 网页面板(启停感知与跟随 / 实时预览 / 录制 / **Demo视频** / 速度距离热调)+ 一键启停/还原脚本 |
+| `code/pending_updates/` | (空)写好未上车的新版放这里;平滑化版已于 2026-07-07 部署 |
 | `follow_data_collector/` | Phase1 数据采集器(**只监听 CAN、绝不控车**) |
 | `experiment_plan.html` / `todo.html` | 实验计划与待办清单 |
 
@@ -31,5 +31,5 @@
 
 ## 安全底线
 
-控车默认 **dry-run 不发帧**;硬限速 0.4 m/s + 绝对天花板 0.6 m/s;死人开关;
+控车默认 **dry-run 不发帧**;默认限速 0.4 m/s,面板可热调(>0.6 需二次确认),绝对天花板 1.5 m/s=固件上限;死人开关;
 `--arm` 才真发 CAN(且需车轮架空 / 充电枪拔出 / 急停释放)。
