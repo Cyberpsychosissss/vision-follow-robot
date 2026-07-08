@@ -24,14 +24,14 @@ GRAB_OUT  = os.environ.get('GRAB_OUT', RUNTIME + '/grab')
 PORT      = int(os.environ.get('FOLLOW_WEB_PORT', '8080'))
 REC_FPS   = 5.0
 DEMO_FPS  = 10.0    # demo 视频写入帧率(按墙钟节拍写最新帧, 播放即真实速度)
-SPEED_CAP = 1.5     # m/s  面板可设的最高速度天花板(=固件/car_control ABS_MAX_SPEED)
+SPEED_CAP = 2.2     # m/s  面板可设的最高速度天花板(=FR-07Pro硬件规格8km/h, car_control ABS_MAX_SPEED)
 CONTAINER = os.environ.get('APOLLO_CONTAINER', 'apollo_dev_nvidia')
 
 # 容器内感知进程启动命令(grabber 写 grab/, yolo_follow 检人写 target.json)
-# 帧率提到 grabber@9fps / yolo@15hz: 喂控制器更连续, 跟随更跟手(相机本身 ~9.5fps)。
+# 帧率: grabber --write-fps 15(=不限流, 相机实测 ~12.5fps 全吃满; 旧值9白扔近30%帧), yolo 15hz。
 GRAB_CMD = ("docker exec -d %s bash -c 'cd /apollo/follow_data/zkhy_grab && "
             "LD_LIBRARY_PATH=/apollo/follow_data/lib:/apollo/modules/drivers/zkhy/src/Bin "
-            "./zkhy_grabber --out-dir /apollo/follow_data/runtime/grab --duration 0 --write-fps 9 "
+            "./zkhy_grabber --out-dir /apollo/follow_data/runtime/grab --duration 0 --write-fps 15 "
             "> /tmp/grab.log 2>&1'") % CONTAINER
 YOLO_CMD = ("docker exec -d %s bash -c 'cd /apollo/follow_data/trtx/build && "
             "LD_LIBRARY_PATH=/apollo/follow_data/trtx/build:/usr/lib/aarch64-linux-gnu/tegra:/usr/local/cuda-10.0/lib64 "
@@ -76,7 +76,7 @@ def follow_start(arm, steer_only=False):
         p = S.get('follow_proc')
         if p and p.poll() is None:
             return False, '跟随控制器已在运行, 先停止'
-        cmd = [sys.executable, os.path.join(BIN, 'follow_controller.py')]
+        cmd = [sys.executable, '-u', os.path.join(BIN, 'follow_controller.py')]   # -u: 日志不缓冲, 短跑也能看到
         if arm:
             cmd.append('--arm')
         if steer_only:
@@ -131,7 +131,7 @@ def set_dist(path):
 
 
 def set_speed(path):
-    """从 /set_speed?max= 写最高速度, follow_controller 热读生效(天花板 1.5=固件上限)。"""
+    """从 /set_speed?max= 写最高速度, follow_controller 热读生效(天花板 2.2=硬件规格 8km/h)。"""
     try:
         q = parse_qs(urlparse(path).query)
         v = float(q.get('max', ['0'])[0])
@@ -595,10 +595,18 @@ def _demo_overlay(cv2, f, tgt, fol, cam):
     return f
 
 
+_DEMO_CSV_HEADER = ('frame,ts,state,armed,steer_only,dist_m,lateral_m,cmd_speed,cmd_steer,'
+                    'max_speed,desired_min,desired_max,gate,tgt_valid,raw_dist_m,raw_lateral_m,'
+                    'off_x,box_h_norm,conf,n_persons,bx,by,bw,bh,'
+                    'cam_fps,disp_fps,brightness,volt_v,curr_a,remain_ah,soc_pct,charging\n')
+
+
 def _demo_loop(path_base, stop_ev, meta):
-    """按墙钟 DEMO_FPS 节拍写最新左目帧+叠加层 → 播放即真实速度。独立于跟随/数据采集。"""
+    """按墙钟 DEMO_FPS 节拍写最新左目帧+叠加层 → 播放即真实速度。独立于跟随/数据采集。
+    同名 .csv 每视频帧记一行全量数据(第N帧=第N行, 与画面严格对齐, 供离线分析)。"""
     import cv2
     writer = None; size = None
+    log_f = None
     last_m = None; frame = None
     last_dm = None; disp = None
     try:
@@ -657,14 +665,47 @@ def _demo_loop(path_base, stop_ev, meta):
                 if writer is None:
                     meta['error'] = 'VideoWriter 打不开(无可用编码器)'
                     return
+                try:                                  # 同名数据日志(行缓冲, 掉电最多丢一行)
+                    log_f = open(path_base + '.csv', 'w', buffering=1)
+                    log_f.write(_DEMO_CSV_HEADER)
+                    meta['csv'] = os.path.basename(path_base) + '.csv'
+                except Exception:
+                    log_f = None
             if (f.shape[1], f.shape[0]) != size:
                 f = cv2.resize(f, size)
             writer.write(f)
             meta['frames'] = meta.get('frames', 0) + 1
+            if log_f is not None:
+                try:
+                    try:
+                        lux = int(round(float(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).mean())))
+                    except Exception:
+                        lux = None
+                    des = (fol.get('desired') or [None, None]) if fol else [None, None]
+                    bb = (tgt.get('bbox') or [None, None, None, None])
+                    row = [meta['frames'], '%.3f' % time.time(),
+                           (fol.get('state') if fol else 'OFF'),
+                           int(bool(fol.get('armed'))), int(bool(fol.get('steer_only'))),
+                           fol.get('dist_m'), fol.get('lateral_m'),
+                           fol.get('cmd_speed'), fol.get('cmd_steer'), fol.get('max_speed'),
+                           des[0], des[1], fol.get('gate'),
+                           int(bool(tgt.get('valid'))), tgt.get('dist_m'), tgt.get('lateral_m'),
+                           tgt.get('off_x'), tgt.get('box_h_norm'), tgt.get('conf'), tgt.get('n_persons'),
+                           bb[0], bb[1], bb[2], bb[3],
+                           cam.get('left_fps'), cam.get('disparity_fps'), lux,
+                           bms.get('voltage_v'), bms.get('current_a'), bms.get('remaining_ah'),
+                           bms.get('soc_pct'),
+                           ('' if bms.get('charging') is None else int(bool(bms.get('charging'))))]
+                    log_f.write(','.join('' if v is None else str(v) for v in row) + '\n')
+                except Exception:
+                    pass
             stop_ev.wait(max(0.0, 1.0 / DEMO_FPS - (time.time() - t0)))
     finally:
         if writer is not None:
             try: writer.release()                    # 必须 release, 否则 mp4 缺 moov 打不开
+            except Exception: pass
+        if log_f is not None:
+            try: log_f.close()
             except Exception: pass
 
 
@@ -775,7 +816,12 @@ def status():
 
 
 def serve_jpeg(names, resize='720x'):
-    """返回 JPEG 字节。浏览器不认 PPM/PGM, 故用 ImageMagick convert 实时转 JPEG。"""
+    """返回 JPEG 字节。浏览器不认 PPM/PGM: 优先 cv2 转(快, 车上现成),
+    没有 cv2 再退 ImageMagick convert(有些机器没装, 这是摄像头黑屏的老病根)。"""
+    try:
+        width = int(str(resize).split('x')[0])
+    except Exception:
+        width = 720
     for n in names:
         p = os.path.join(GRAB_OUT, n)
         if not os.path.exists(p):
@@ -785,7 +831,19 @@ def serve_jpeg(names, resize='720x'):
                 return open(p, 'rb').read()
             except Exception:
                 continue
-        try:  # ppm/pgm -> jpeg, 顺便缩到 720 宽减小体积
+        try:  # ① cv2: ppm/pgm 直接读 + 缩宽 + 编 JPEG, 单帧 ~20ms
+            import cv2
+            img = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+            if img is not None:
+                h, w = img.shape[:2]
+                if w > width:
+                    img = cv2.resize(img, (width, int(h * width / w)))
+                ok, buf = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+                if ok:
+                    return buf.tobytes()
+        except Exception:
+            pass
+        try:  # ② 兜底: ImageMagick
             r = subprocess.run(['convert', p, '-resize', resize, 'jpg:-'],
                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=6)
             if r.returncode == 0 and r.stdout:
@@ -862,9 +920,12 @@ a{color:var(--blue);text-decoration:none}
 <input id=dmin type=number step=0.5 min=0.5 value=2> ~
 <input id=dmax type=number step=0.5 value=4>
 <button onclick="setDist()" style="background:#7c3aed;padding:9px 16px;font-size:15px">设置</button>
-<div style="margin:13px 0 7px;font-size:13px">最高速度 m/s (≤1.5, 热生效) <span id=vcur style="color:#64748b"></span></div>
-<input id=vmax type=number step=0.1 min=0.1 max=1.5 value=0.4>
+<div style="margin:13px 0 7px;font-size:13px">最高速度 m/s (≤2.2=硬件上限, 热生效) <span id=vcur style="color:#64748b"></span></div>
+<input id=vmax type=number step=0.1 min=0.1 max=2.2 value=0.4>
 <button onclick="setSpeed()" style="background:#7c3aed;padding:9px 16px;font-size:15px">设置</button>
+<div style="margin:13px 0 7px;font-size:13px">模式开关 (热生效)</div>
+<label style="font-size:14px;margin-right:16px"><input id=mgrass type=checkbox onchange="setMode()"> 草地模式 (最低驱动 0.5)</label>
+<label style="font-size:14px"><input id=mseek type=checkbox onchange="setMode()"> 丢失寻回 (满舵找人+倒车归位)</label>
 <div class=k id=ctlmsg style=margin-top:8px>ARM 前务必: 车轮架空 / 充电枪拔出 / 急停释放</div></div>
 
 <div class=card><div class=k style=margin-bottom:8px>Demo 视频 (左侧数据栏 + YOLO框, 直接烧进画面)</div>
@@ -966,8 +1027,13 @@ function tick(){fetch('/status').then(r=>r.json()).then(s=>{
  (s.demos||[]).forEach(function(d){var a=document.createElement('a');a.href='/demo?f='+encodeURIComponent(d.name);a.textContent=d.name+' ('+d.mb+'MB)';a.style.cssText='color:#0a84ff;display:inline-block;margin-right:12px';dl.appendChild(a);});
  var vm=(f.max_speed!=null)?f.max_speed:((s.config||{}).max_speed);
  document.getElementById('vcur').textContent=(vm!=null)?('当前 '+vm):'当前 0.4 (默认)';
+ var cfg=s.config||{};
+ if(document.activeElement.id!=='mgrass')document.getElementById('mgrass').checked=!!cfg.grass;
+ if(document.activeElement.id!=='mseek')document.getElementById('mseek').checked=(cfg.seek===undefined)?true:!!cfg.seek;
  drawBox(s.target||{});
 }).catch(e=>{});}
+function setMode(){var g=document.getElementById('mgrass').checked?1:0,k=document.getElementById('mseek').checked?1:0;
+ fetch('/set_mode?grass='+g+'&seek='+k,{method:'POST'}).then(r=>r.json()).then(j=>{document.getElementById('ctlmsg').textContent=(j.msg||'');}).catch(e=>{});}
 function drawBox(tg){var pv=document.getElementById('prev'),yb=document.getElementById('ybox'),yl=document.getElementById('ylabel');
  if(tg&&tg.bbox&&tg.img_w&&pv.clientWidth>0){var sx=pv.clientWidth/tg.img_w,sy=pv.clientHeight/tg.img_h;
   var bx=tg.bbox[0]*sx,by=tg.bbox[1]*sy,bw=tg.bbox[2]*sx,bh=tg.bbox[3]*sy;
@@ -1073,6 +1139,17 @@ class H(BaseHTTPRequestHandler):
             ok, m = demo_stop(); j(ok, m)
         elif p.startswith('/set_speed'):
             ok, m = set_speed(p); j(ok, m)
+        elif p.startswith('/set_mode'):
+            try:
+                q = parse_qs(urlparse(p).query)
+                cfg = {}
+                if 'grass' in q: cfg['grass'] = (q['grass'][0] == '1')
+                if 'seek' in q:  cfg['seek'] = (q['seek'][0] == '1')
+                _write_config(cfg)
+                j(True, '模式: 草地=%s 寻回=%s (热生效)' % (
+                    '开' if cfg.get('grass') else '关', '开' if cfg.get('seek') else '关'))
+            except Exception as e:
+                j(False, '设置失败: %s' % e)
         elif p.startswith('/follow_dry'):
             ok, m = follow_start(False); j(ok, m)
         elif p.startswith('/follow_arm'):

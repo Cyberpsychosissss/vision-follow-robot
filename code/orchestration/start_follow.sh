@@ -28,11 +28,11 @@ if [ "$WEB_ONLY" = "1" ]; then
 fi
 
 # 2) 感知: 容器内 grabber(写真实米深度) + yolo_follow(检人写 target.json)
-#    帧率提到 grabber@9fps / yolo@15hz —— 喂控制器更连续, 跟随更跟手。
+#    grabber --write-fps 15 = 不限流(相机实测 ~12.5fps 全吃满; 旧值 9 会白扔近 30% 帧)。
 docker exec "$CONTAINER" pgrep -x zkhy_grabber >/dev/null 2>&1 || \
   docker exec -d "$CONTAINER" bash -c "cd /apollo/follow_data/zkhy_grab && \
     LD_LIBRARY_PATH=/apollo/follow_data/lib:/apollo/modules/drivers/zkhy/src/Bin \
-    ./zkhy_grabber --out-dir $GRAB_OUT --duration 0 --write-fps 9 > /tmp/grab.log 2>&1"
+    ./zkhy_grabber --out-dir $GRAB_OUT --duration 0 --write-fps 15 > /tmp/grab.log 2>&1"
 docker exec "$CONTAINER" pgrep -x yolo_follow >/dev/null 2>&1 || \
   docker exec -d "$CONTAINER" bash -c "cd /apollo/follow_data/trtx/build && \
     LD_LIBRARY_PATH=/apollo/follow_data/trtx/build:/usr/lib/aarch64-linux-gnu/tegra:/usr/local/cuda-10.0/lib64 \
