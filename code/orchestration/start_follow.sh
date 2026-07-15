@@ -7,6 +7,7 @@
 set -u
 BIN="$(cd "$(dirname "$0")" && pwd)"
 CONTAINER="${APOLLO_CONTAINER:-apollo_dev_nvidia}"
+SEL_CONTAINER="${SELECTOR_CONTAINER:-follow_yolo2026}"   # ReID 选择器容器(有 onnxruntime)
 PORT="${FOLLOW_WEB_PORT:-8080}"
 GRAB_OUT=/apollo/follow_data/runtime/grab
 WEB_ONLY=0
@@ -27,7 +28,7 @@ if [ "$WEB_ONLY" = "1" ]; then
   exit 0
 fi
 
-# 2) 感知: 容器内 grabber(写真实米深度) + yolo_follow(检人写 target.json)
+# 2) 感知: grabber(真实米深度) → yolo_follow(检人写 detections.json) → target_selector(ReID 挑主人写 target.json)
 #    grabber --write-fps 15 = 不限流(相机实测 ~12.5fps 全吃满; 旧值 9 会白扔近 30% 帧)。
 docker exec "$CONTAINER" pgrep -x zkhy_grabber >/dev/null 2>&1 || \
   docker exec -d "$CONTAINER" bash -c "cd /apollo/follow_data/zkhy_grab && \
@@ -37,11 +38,18 @@ docker exec "$CONTAINER" pgrep -x yolo_follow >/dev/null 2>&1 || \
   docker exec -d "$CONTAINER" bash -c "cd /apollo/follow_data/trtx/build && \
     LD_LIBRARY_PATH=/apollo/follow_data/trtx/build:/usr/lib/aarch64-linux-gnu/tegra:/usr/local/cuda-10.0/lib64 \
     ./yolo_follow --engine yolov5s.engine --grab-dir $GRAB_OUT \
-    --runtime /apollo/follow_data/runtime --hz 15 > /tmp/yolo_follow.log 2>&1"
+    --runtime /apollo/follow_data/runtime --out detections.json --hz 15 > /tmp/yolo_follow.log 2>&1"
+docker exec "$SEL_CONTAINER" pgrep -f '[t]arget_selector' >/dev/null 2>&1 || \
+  docker exec -d "$SEL_CONTAINER" bash -c "cd /apollo/follow_data/bin && \
+    OPENBLAS_CORETYPE=ARMV8 PYTHONIOENCODING=utf-8 \
+    FOLLOW_RUNTIME=/apollo/follow_data/runtime \
+    OSNET_ONNX=/apollo/follow_data/models/osnet_x0_25_msmt17.onnx \
+    python3 -u target_selector.py > /tmp/selector.log 2>&1"
 sleep 2
 G=$(docker exec "$CONTAINER" pgrep -x zkhy_grabber >/dev/null 2>&1 && echo ✓ || echo "✗(看 /tmp/grab.log, 多半相机被占)")
 Y=$(docker exec "$CONTAINER" pgrep -x yolo_follow  >/dev/null 2>&1 && echo ✓ || echo "✗(看 /tmp/yolo_follow.log)")
-echo "[2/2] 感知: grabber $G   yolo $Y"
+S=$(docker exec "$SEL_CONTAINER" pgrep -f '[t]arget_selector' >/dev/null 2>&1 && echo ✓ || echo "✗(看容器 $SEL_CONTAINER:/tmp/selector.log)")
+echo "[2/2] 感知: grabber $G   yolo $Y   选择器 $S"
 echo
-echo "下一步: 浏览器开面板 → 「左目+YOLO框」里看到人 → 先「▶ DRY-RUN」看决策对不对 → 再 ARM。"
+echo "下一步: 浏览器开面板 → 「左目+YOLO框」里看到人 → 「🔒 锁定我为主人」→ 先「▶ DRY-RUN」看决策 → 再 ARM。"
 echo "全部停止: $BIN/stop_follow.sh"

@@ -26,8 +26,13 @@ REC_FPS   = 5.0
 DEMO_FPS  = 10.0    # demo 视频写入帧率(按墙钟节拍写最新帧, 播放即真实速度)
 SPEED_CAP = 2.2     # m/s  面板可设的最高速度天花板(=FR-07Pro硬件规格8km/h, car_control ABS_MAX_SPEED)
 CONTAINER = os.environ.get('APOLLO_CONTAINER', 'apollo_dev_nvidia')
+# ReID 选择器跑在另一个容器(有 onnxruntime; apollo 容器是 py2.7/3.4 装不了现代包)
+SEL_CONTAINER = os.environ.get('SELECTOR_CONTAINER', 'follow_yolo2026')
 
-# 容器内感知进程启动命令(grabber 写 grab/, yolo_follow 检人写 target.json)
+# 容器内感知进程启动命令:
+#   grabber      → grab/ (左目图 + 真实米深度 + 障碍物)
+#   yolo_follow  → detections.json (所有 person 候选框; --out 改道, 不再直写 target.json)
+#   target_selector → target.json (ReID 从候选里挑「主人」; 未锁定时透传最大框 = 旧行为)
 # 帧率: grabber --write-fps 15(=不限流, 相机实测 ~12.5fps 全吃满; 旧值9白扔近30%帧), yolo 15hz。
 GRAB_CMD = ("docker exec -d %s bash -c 'cd /apollo/follow_data/zkhy_grab && "
             "LD_LIBRARY_PATH=/apollo/follow_data/lib:/apollo/modules/drivers/zkhy/src/Bin "
@@ -36,7 +41,13 @@ GRAB_CMD = ("docker exec -d %s bash -c 'cd /apollo/follow_data/zkhy_grab && "
 YOLO_CMD = ("docker exec -d %s bash -c 'cd /apollo/follow_data/trtx/build && "
             "LD_LIBRARY_PATH=/apollo/follow_data/trtx/build:/usr/lib/aarch64-linux-gnu/tegra:/usr/local/cuda-10.0/lib64 "
             "./yolo_follow --engine yolov5s.engine --grab-dir /apollo/follow_data/runtime/grab "
-            "--runtime /apollo/follow_data/runtime --hz 15 > /tmp/yolo_follow.log 2>&1'") % CONTAINER
+            "--runtime /apollo/follow_data/runtime --out detections.json --hz 15 "
+            "> /tmp/yolo_follow.log 2>&1'") % CONTAINER
+SEL_CMD = ("docker exec -d %s bash -c 'cd /apollo/follow_data/bin && "
+           "OPENBLAS_CORETYPE=ARMV8 PYTHONIOENCODING=utf-8 "
+           "FOLLOW_RUNTIME=/apollo/follow_data/runtime "
+           "OSNET_ONNX=/apollo/follow_data/models/osnet_x0_25_msmt17.onnx "
+           "python3 -u target_selector.py > /tmp/selector.log 2>&1'") % SEL_CONTAINER
 
 S = {'recording': False, 'run': None, 'host_run': None, 'start_ts': 0,
      'can_proc': None, 'rec_thread': None, 'rec_stop': None,
@@ -55,16 +66,26 @@ def _sh(cmd, timeout=20):
         return -1, str(e)
 
 
+def selector_running():
+    return _sh("docker exec %s pgrep -f [t]arget_selector" % SEL_CONTAINER)[0] == 0
+
+
 def perception_start():
-    """容器内拉起 grabber + yolo_follow(各自若没在跑才起)。"""
+    """容器内拉起 grabber + yolo_follow + target_selector(各自若没在跑才起)。"""
     if _sh("docker exec %s pgrep -x zkhy_grabber" % CONTAINER)[0] != 0:
         _sh(GRAB_CMD)
     if _sh("docker exec %s pgrep -x yolo_follow" % CONTAINER)[0] != 0:
         _sh(YOLO_CMD)
-    return True, '感知已启动(grabber+yolo_follow)'
+    sel_msg = ''
+    if not selector_running():
+        rc, out = _sh(SEL_CMD)
+        if rc != 0:
+            sel_msg = ' ⚠ 选择器起不来(容器 %s 在吗?): %s' % (SEL_CONTAINER, out.strip()[:80])
+    return True, '感知已启动(grabber+yolo+选择器)' + sel_msg
 
 
 def perception_stop():
+    _sh("docker exec %s pkill -f [t]arget_selector" % SEL_CONTAINER)
     _sh("docker exec %s pkill -x yolo_follow" % CONTAINER)
     _sh("docker exec %s pkill -x zkhy_grabber" % CONTAINER)
     return True, '感知已停止'
@@ -128,6 +149,19 @@ def set_dist(path):
         return True, '保持距离设为 %.1f~%.1f m (热生效)' % (mn, mx)
     except Exception as e:
         return False, '设置失败: %s' % e
+
+
+def set_lock(on):
+    """锁定/解锁「主人」: 写 follow_config.json, target_selector 边沿触发(靠 lock_ts 变化)。
+    锁定 = 把当前画面里最大的人注册成主人, 之后只跟他; 解锁 = 回到「跟最大框」。"""
+    if on:
+        tgt = _read_json(os.path.join(RUNTIME, 'target.json'), max_age=2)
+        if not tgt or not tgt.get('valid'):
+            return False, '画面里没检到人, 无法锁定(先站到相机前)'
+        _write_config({'lock': True, 'lock_ts': time.time()})
+        return True, '🔒 已锁定当前目标为主人(路人不再抢跟随)'
+    _write_config({'lock': False})
+    return True, '已解锁: 回到跟最显著的人'
 
 
 def set_speed(path):
@@ -377,28 +411,59 @@ def _demo_compose(cv2, cam, disp, tgt, fol, cam_st, bms):
     canvas = np.zeros((VIEW_H * 2, SIDEBAR_W + VIEW_W, 3), dtype='uint8')
     canvas[:] = C_BG
 
-    # ================= 右上: 相机画面 + YOLO 角标框 =================
+    # ================= 右上: 相机画面 + 候选灰框 + 选中绿角标框 =================
     cv_ = cv2.resize(cam, (VIEW_W, VIEW_H))
     bb = tgt.get('bbox'); iw = tgt.get('img_w'); ih = tgt.get('img_h')
-    if bb and iw and ih and tgt.get('valid'):
+    locked = bool(tgt.get('locked'))
+    if iw and ih:
         sx, sy = float(VIEW_W) / iw, float(VIEW_H) / ih
-        x, y = int(bb[0] * sx), int(bb[1] * sy)
-        w, h = int(bb[2] * sx), int(bb[3] * sy)
-        _corner_box(cv2, cv_, x, y, w, h, C_GREEN, t=2, L=20)
-        txt = _fv(tgt.get('dist_m'), '%.2fm')
-        if tgt.get('conf') is not None:
-            txt += '  %d%%' % round(tgt['conf'] * 100)
-        tag = _asset(cv2, 'tag_person')
-        (tw_, th_), _b = cv2.getTextSize(txt, FONT, 0.5, 1)
-        cw = (tag.shape[1] + 8 if tag is not None else 0) + tw_ + 14
-        cy1 = max(0, y - 28)
-        cv2.rectangle(cv_, (x, cy1), (x + cw, cy1 + 24), C_CHIPBG, -1)
-        tx = x + 7
-        if tag is not None:
-            _blit(cv_, tag, tx, cy1 + (24 - tag.shape[0]) // 2)
-            tx += tag.shape[1] + 8
-        cv2.putText(cv_, txt, (tx, cy1 + 17), FONT, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        # 其他候选(选择器输出): 细灰框 + 外观相似度%。丢失时也画 → demo 能看到「路人在场但不跟」
+        sel = tuple(bb) if (bb and tgt.get('valid')) else None
+        for c in (tgt.get('candidates') or []):
+            cb = c.get('bbox')
+            if not cb or (sel and tuple(cb) == sel):
+                continue
+            cx, cy = int(cb[0] * sx), int(cb[1] * sy)
+            cw2, ch2 = int(cb[2] * sx), int(cb[3] * sy)
+            cv2.rectangle(cv_, (cx, cy), (cx + cw2, cy + ch2), C_SUB, 1)
+            if c.get('app') is not None:
+                cv2.putText(cv_, '%d%%' % round(c['app'] * 100), (cx + 3, max(14, cy - 5)),
+                            FONT, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+        if bb and tgt.get('valid'):
+            x, y = int(bb[0] * sx), int(bb[1] * sy)
+            w, h = int(bb[2] * sx), int(bb[3] * sy)
+            _corner_box(cv2, cv_, x, y, w, h, C_GREEN, t=2, L=20)
+            txt = _fv(tgt.get('dist_m'), '%.2fm')
+            # 锁定时显示外观相似度(lock_conf=原始余弦), 未锁定显示 YOLO 置信度
+            if locked and tgt.get('lock_conf') is not None:
+                txt += '  %d%%' % round(tgt['lock_conf'] * 100)
+            elif tgt.get('conf') is not None:
+                txt += '  %d%%' % round(tgt['conf'] * 100)
+            tag = _asset(cv2, 'tag_owner' if locked else 'tag_person')
+            (tw_, th_), _b = cv2.getTextSize(txt, FONT, 0.5, 1)
+            cw = (tag.shape[1] + 8 if tag is not None else 0) + tw_ + 14
+            cy1 = max(0, y - 28)
+            cv2.rectangle(cv_, (x, cy1), (x + cw, cy1 + 24), C_CHIPBG, -1)
+            tx = x + 7
+            if tag is not None:
+                _blit(cv_, tag, tx, cy1 + (24 - tag.shape[0]) // 2)
+                tx += tag.shape[1] + 8
+            cv2.putText(cv_, txt, (tx, cy1 + 17), FONT, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
     canvas[0:VIEW_H, SIDEBAR_W:] = cv_
+
+    # 锁定状态 chip(相机区右上角): 锁定跟踪/重捕获中/目标丢失; 未锁定不画(与旧版画面一致)
+    if locked:
+        track = tgt.get('track') or 'TRACKING'
+        lk_col = {'TRACKING': C_GREEN, 'REACQ': C_AMBER, 'LOST': C_RED}.get(track, C_GRAY)
+        lk_a = _asset(cv2, {'TRACKING': 'chip_lk_track', 'REACQ': 'chip_lk_reacq',
+                            'LOST': 'chip_lk_lost'}.get(track, 'chip_lk_track'))
+        lk_w = (lk_a.shape[1] + 16) if lk_a is not None else 108
+        lx1 = SIDEBAR_W + VIEW_W - lk_w - 8
+        cv2.rectangle(canvas, (lx1, 8), (lx1 + lk_w, 34), lk_col, -1)
+        if lk_a is not None:
+            _blit(canvas, lk_a, lx1 + 8, 8 + (26 - lk_a.shape[0]) // 2)
+        else:  # 素材缺失(车上 demo_assets 没更新)也别留空 chip
+            cv2.putText(canvas, track, (lx1 + 8, 26), FONT, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
     # ================= 右下: 视差图(JET 伪彩) =================
     if disp is not None:
@@ -406,7 +471,7 @@ def _demo_compose(cv2, cam, disp, tgt, fol, cam_st, bms):
         canvas[VIEW_H:, SIDEBAR_W:] = cv2.applyColorMap(d_, cv2.COLORMAP_JET)
     else:
         cv2.putText(canvas, '--', (SIDEBAR_W + VIEW_W // 2 - 15, VIEW_H + VIEW_H // 2),
-                    FONT, 1.0, C_SUB, 2, cv2.LINE_AA)
+                    FONT, 1.0, C_SUB, 2, cv2.LINE_8)
 
     # 视图标题 chip + 分隔线
     for cap, cy0 in (('v_cam', 8), ('v_disp', VIEW_H + 8)):
@@ -435,9 +500,11 @@ def _demo_compose(cv2, cam, disp, tgt, fol, cam_st, bms):
     des = (fol.get('desired') if fol else None) or []
     dist = fol.get('dist_m') if fol else None
     _blit(canvas, _asset(cv2, 'l_dist'), 20, 214)
-    cv2.putText(canvas, _fv(dist), (20, 262), FONT, 1.2, C_TEXT, 2, cv2.LINE_AA)
+    # 粗细=2 的数值文字必须用 LINE_8: 车上 cv2 3.2(aarch64) 的 LINE_AA 粗笔画光栅化
+    # 会溢出, 从字形中段画一条贯穿到画布右缘的白色横线(实测真实值域 26% 触发, LINE_8 为 0)
+    cv2.putText(canvas, _fv(dist), (20, 262), FONT, 1.2, C_TEXT, 2, cv2.LINE_8)
     _blit(canvas, _asset(cv2, 'l_lat'), 235, 214)
-    cv2.putText(canvas, _fv(fol.get('lateral_m') if fol else None, '%+.2f'), (235, 258), FONT, 0.85, C_TEXT, 2, cv2.LINE_AA)
+    cv2.putText(canvas, _fv(fol.get('lateral_m') if fol else None, '%+.2f'), (235, 258), FONT, 0.85, C_TEXT, 2, cv2.LINE_8)
 
     def dx(v):
         return int(20 + max(0.0, min(1.0, v / 6.0)) * 360)
@@ -456,7 +523,7 @@ def _demo_compose(cv2, cam, disp, tgt, fol, cam_st, bms):
     vmax = (fol.get('max_speed') if fol else None) or 0.4
     spd = fol.get('cmd_speed') if fol else None
     _blit(canvas, _asset(cv2, 'l_speed'), 20, 348)
-    cv2.putText(canvas, _fv(spd), (20, 394), FONT, 0.9, C_TEXT, 2, cv2.LINE_AA)
+    cv2.putText(canvas, _fv(spd), (20, 394), FONT, 0.9, C_TEXT, 2, cv2.LINE_8)
     cv2.putText(canvas, 'max %.2f' % vmax, (285, 392), FONT, 0.5, C_SUB, 1, cv2.LINE_AA)
     cv2.rectangle(canvas, (20, 406), (380, 422), C_BAR_BG, -1)
     if spd is not None and vmax > 0:
@@ -491,7 +558,7 @@ def _demo_compose(cv2, cam, disp, tgt, fol, cam_st, bms):
     cv2.circle(canvas, (ccx, ccy), 5, C_TEXT, -1)
     _blit(canvas, _asset(cv2, 'l_left'), 66, 596)
     _blit(canvas, _asset(cv2, 'l_right'), 316, 596)
-    cv2.putText(canvas, _fv(st_, '%+.1f'), (162, 632), FONT, 0.85, C_TEXT, 2, cv2.LINE_AA)
+    cv2.putText(canvas, _fv(st_, '%+.1f'), (162, 632), FONT, 0.85, C_TEXT, 2, cv2.LINE_8)
     hline(654)
 
     # ---- 设定 / 感知 ----
@@ -523,7 +590,7 @@ def _demo_compose(cv2, cam, disp, tgt, fol, cam_st, bms):
         _chip(cv2, canvas, 290, 766, 380, 792, (246, 130, 59) if bms.get('charging') else C_GRAY,
               _asset(cv2, 'chip_chg' if bms.get('charging') else 'chip_dis'))
     soc = bms.get('soc_pct')
-    cv2.putText(canvas, ('%d%%' % soc) if soc is not None else '--', (20, 818), FONT, 0.95, C_TEXT, 2, cv2.LINE_AA)
+    cv2.putText(canvas, ('%d%%' % soc) if soc is not None else '--', (20, 818), FONT, 0.95, C_TEXT, 2, cv2.LINE_8)
     cv2.rectangle(canvas, (110, 804), (380, 818), C_BAR_BG, -1)
     if soc is not None:
         bc = (246, 130, 59) if bms.get('charging') else (C_RED if soc < 20 else C_GREEN)
@@ -542,15 +609,30 @@ def _demo_overlay(cv2, f, tgt, fol, cam):
     H, W = f.shape[:2]
     # YOLO 目标框: target.json 的 bbox 是感知分辨率像素, 按比例缩放到本帧
     bb = tgt.get('bbox'); iw = tgt.get('img_w'); ih = tgt.get('img_h')
+    locked = bool(tgt.get('locked'))
+    if iw and ih:
+        sx, sy = float(W) / iw, float(H) / ih
+        sel = tuple(bb) if (bb and tgt.get('valid')) else None
+        for c in (tgt.get('candidates') or []):   # 其他候选: 灰框+相似度(丢失时也画)
+            cb = c.get('bbox')
+            if not cb or (sel and tuple(cb) == sel):
+                continue
+            cx, cy = int(cb[0] * sx), int(cb[1] * sy)
+            cv2.rectangle(f, (cx, cy), (cx + int(cb[2] * sx), cy + int(cb[3] * sy)), (99, 85, 75), 1)
+            if c.get('app') is not None:
+                cv2.putText(f, '%d%%' % round(c['app'] * 100), (cx + 2, max(14, cy - 4)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
     if bb and iw and ih and tgt.get('valid'):
         sx, sy = float(W) / iw, float(H) / ih
         x, y = int(bb[0] * sx), int(bb[1] * sy)
         w, h = int(bb[2] * sx), int(bb[3] * sy)
         cv2.rectangle(f, (x, y), (x + w, y + h), (88, 209, 48), 2)
-        lbl = 'PERSON'
+        lbl = 'OWNER' if locked else 'PERSON'
         if tgt.get('dist_m') is not None:
             lbl += ' %.2fm' % tgt['dist_m']
-        if tgt.get('conf') is not None:
+        if locked and tgt.get('lock_conf') is not None:
+            lbl += ' %d%%' % round(tgt['lock_conf'] * 100)
+        elif tgt.get('conf') is not None:
             lbl += ' %d%%' % round(tgt['conf'] * 100)
         (tw_, th_), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
         ly = max(th_ + 4, y - 6)
@@ -582,6 +664,11 @@ def _demo_overlay(cv2, f, tgt, fol, cam):
         ('CAM    %.1f fps   CONF %s' % (
             cam_fps,
             ('%d%%' % round(tgt['conf'] * 100)) if tgt.get('conf') is not None else '--'), (200, 200, 200)),
+        (('LOCK   %s%s' % (tgt.get('track') or 'ON',
+                           (' %d%%' % round(tgt['lock_conf'] * 100)) if tgt.get('lock_conf') is not None else ''))
+         if locked else 'LOCK   OFF (largest person)',
+         {'TRACKING': (88, 209, 48), 'REACQ': (10, 214, 255), 'LOST': (58, 69, 255)}.get(
+             tgt.get('track'), (200, 200, 200)) if locked else (140, 140, 140)),
     ]
     pad, lh = 10, 24
     bw, bh = 380, pad * 2 + lh * len(lines)
@@ -598,7 +685,8 @@ def _demo_overlay(cv2, f, tgt, fol, cam):
 _DEMO_CSV_HEADER = ('frame,ts,state,armed,steer_only,dist_m,lateral_m,cmd_speed,cmd_steer,'
                     'max_speed,desired_min,desired_max,gate,tgt_valid,raw_dist_m,raw_lateral_m,'
                     'off_x,box_h_norm,conf,n_persons,bx,by,bw,bh,'
-                    'cam_fps,disp_fps,brightness,volt_v,curr_a,remain_ah,soc_pct,charging\n')
+                    'cam_fps,disp_fps,brightness,volt_v,curr_a,remain_ah,soc_pct,charging,'
+                    'locked,track,lock_conf,n_cands\n')   # ReID 列追加在尾部, 老分析脚本列序不变
 
 
 def _demo_loop(path_base, stop_ev, meta):
@@ -609,6 +697,7 @@ def _demo_loop(path_base, stop_ev, meta):
     log_f = None
     last_m = None; frame = None
     last_dm = None; disp = None
+    last_fresh = time.time()      # 上次拿到新左目帧的墙钟(冻帧检测)
     try:
         while not stop_ev.is_set():
             t0 = time.time()
@@ -620,7 +709,7 @@ def _demo_loop(path_base, stop_ev, meta):
                         if m != last_m:
                             img = cv2.imread(p, cv2.IMREAD_COLOR)
                             if img is not None and img.size:   # 写一半读坏 → 跳过, 沿用上一帧
-                                frame = img; last_m = m
+                                frame = img; last_m = m; last_fresh = t0
                     except Exception:
                         pass
                     break
@@ -650,6 +739,12 @@ def _demo_loop(path_base, stop_ev, meta):
                     _demo_overlay(cv2, f, tgt, fol, cam)
             except Exception:
                 f = frame.copy()                      # 合成出错也别断录
+            stale_s = t0 - last_fresh
+            if stale_s > 2.0:
+                # 相机停帧: 旧版会无限重复最后一帧, 视频看着"正常"其实在录死画面 → 变暗+水印挑明
+                f = cv2.convertScaleAbs(f, alpha=0.45)
+                cv2.putText(f, 'CAMERA STALE %ds' % int(stale_s), (f.shape[1] // 2 - 160, 60),
+                            cv2.FONT_HERSHEY_DUPLEX, 1.1, (68, 68, 239), 2, cv2.LINE_8)
             if writer is None:
                 h, w = f.shape[:2]; size = (w, h)
                 for cc, ext in (('mp4v', '.mp4'), ('XVID', '.avi'), ('MJPG', '.avi')):
@@ -695,7 +790,9 @@ def _demo_loop(path_base, stop_ev, meta):
                            cam.get('left_fps'), cam.get('disparity_fps'), lux,
                            bms.get('voltage_v'), bms.get('current_a'), bms.get('remaining_ah'),
                            bms.get('soc_pct'),
-                           ('' if bms.get('charging') is None else int(bool(bms.get('charging'))))]
+                           ('' if bms.get('charging') is None else int(bool(bms.get('charging')))),
+                           int(bool(tgt.get('locked'))), tgt.get('track') or '',
+                           tgt.get('lock_conf'), len(tgt.get('candidates') or [])]
                     log_f.write(','.join('' if v is None else str(v) for v in row) + '\n')
                 except Exception:
                     pass
@@ -735,14 +832,18 @@ def demo_stop():
             return False, '没有在录 Demo'
         ev = S['demo_stop']; th = S['demo_thread']; meta = S['demo_meta'] or {}
         if ev: ev.set()
-        if th: th.join(timeout=6)
+        still_writing = False
+        if th:
+            th.join(timeout=8)
+            still_writing = th.is_alive()   # 没退完 = writer 还没 release, mp4 缺 moov 暂打不开
         S.update(demo=False, demo_stop=None, demo_thread=None)
     if meta.get('error'):
         return False, 'Demo 失败: %s' % meta['error']
     if not meta.get('frames'):
         return False, 'Demo 无帧(感知没起? 先「▶ 启动感知」出画面再录)'
     dur = int(time.time() - meta.get('start', time.time()))
-    return True, '✔ Demo 已保存: %s (%d帧/%ds), 下方可下载' % (meta.get('file', '?'), meta.get('frames', 0), dur)
+    tail = ' ⚠ 文件还在收尾, 等几秒再下载' if still_writing else ', 下方可下载'
+    return True, '✔ Demo 已保存: %s (%d帧/%ds)%s' % (meta.get('file', '?'), meta.get('frames', 0), dur, tail)
 
 
 _LUX = {'m': None, 'v': None}
@@ -791,9 +892,13 @@ def status():
     s['bms'] = _read_json(os.path.join(RUNTIME, 'bms.json'), max_age=6) or {}
     # 控制进程状态(从文件新鲜度推断, 不每秒 docker exec)
     tgt = _read_json(os.path.join(RUNTIME, 'target.json'), max_age=3)
+    det = _read_json(os.path.join(RUNTIME, 'detections.json'), max_age=3)
     fp = S.get('follow_proc')
+    # yolo 灯看 detections.json(新栈)或 target.json(旧栈, yolo 直写);
+    # 选择器灯看 target.json 是否带 yolo_reid 来源(比每秒 docker exec 便宜)
     s['ctl'] = {'grabber': bool(s['camera']['online']),
-                'yolo': tgt is not None,
+                'yolo': (det is not None) or (tgt is not None),
+                'selector': bool(tgt and tgt.get('source') == 'yolo_reid'),
                 'follow_running': bool(fp and fp.poll() is None),
                 'armed': bool(S.get('follow_armed'))}
     s['target'] = tgt or {}
@@ -853,114 +958,224 @@ def serve_jpeg(names, resize='720x'):
     return None
 
 
-PAGE = u"""<!doctype html><html><head><meta charset=utf-8><title>视觉跟随 · 控制台</title>
+PAGE = u"""<!doctype html><html><head><meta charset=utf-8><title>视觉跟随机器人 · 实验控制台</title>
 <meta name=viewport content="width=device-width,initial-scale=1"><style>
-:root{--bg:#f4f6fa;--card:#fff;--line:#e5eaf2;--txt:#1e2430;--sub:#64748b;--blue:#2563eb}
-body{background:var(--bg);color:var(--txt);font-family:-apple-system,'PingFang SC','Helvetica Neue',Arial,sans-serif;
- margin:0 auto;padding:18px;max-width:1120px;display:grid;grid-template-columns:repeat(auto-fit,minmax(350px,1fr));gap:12px;align-content:start}
-h1{font-size:17px;font-weight:700;letter-spacing:.4px;margin:0;grid-column:1/-1;color:#0f172a;display:flex;align-items:center;gap:8px}
-h1 .dot{width:9px;height:9px;border-radius:50%;background:var(--blue);display:inline-block;box-shadow:0 0 0 4px rgba(37,99,235,.14)}
-h1 .sub{color:var(--sub);font-weight:500;font-size:12.5px;margin-left:2px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:0;box-shadow:0 1px 2px rgba(16,24,40,.04)}
-.wide{grid-column:1/-1}
-.k{color:var(--sub);font-size:12px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
-.kv{background:#f7f9fc;border:1px solid #eef2f7;border-radius:10px;padding:8px 10px}
-.kv .v{font-size:19px;font-weight:650;margin-top:2px;color:#0f172a;font-variant-numeric:tabular-nums}
-button{border:0;border-radius:10px;padding:12px 18px;font-size:15px;font-weight:600;color:#fff;cursor:pointer;transition:filter .15s,transform .05s}
-button:hover{filter:brightness(1.07)}button:active{transform:scale(.98)}
-#start{background:#16a34a}#stop{background:#dc2626}button:disabled{opacity:.35;cursor:default}
-.badge{display:inline-block;padding:3px 10px;border-radius:8px;font-weight:700;font-size:14px}
-.FOLLOW{background:#dcfce7;color:#15803d}.HOLD{background:#fef9c3;color:#a16207}.STOP_NEAR{background:#fee2e2;color:#b91c1c}
-.SEARCH{background:#ede9fe;color:#6d28d9}.COAST{background:#e0f2fe;color:#0369a1}.STEER_ONLY{background:#fef9c3;color:#a16207}.OFF{background:#eef2f7;color:#64748b}
-img{width:100%;border-radius:10px;background:#0b1220;display:block}
-table{width:100%;border-collapse:collapse;font-size:13px}
-td,th{text-align:left;padding:4px 6px;border-bottom:1px solid #eef2f7;color:#334155}th{color:var(--sub);font-weight:600}
-input[type=number]{width:66px;font-size:15px;padding:7px;border-radius:8px;border:1px solid #d7dee9;background:#fff;color:var(--txt)}
-input[type=number]:focus{outline:2px solid rgba(37,99,235,.25);border-color:var(--blue)}
-a{color:var(--blue);text-decoration:none}
-</style></head><body><h1><span class=dot></span>视觉跟随机器人<span class=sub>Jetson AGX Xavier · 双目 + YOLO + CAN</span></h1>
+:root{--paper:#eae5d6;--panel:#f6f3e8;--ink:#23241e;--sub:#6f6a5c;--rule:#c0b8a3;--rule2:#4f4b40;
+--navy:#1e3a5f;--red:#9c2b23;--amber:#8a6a2b;--green:#2e6b3c;--violet:#5b4a8a;--blue:#2b5d8a;--gray:#857f70;
+--mono:'SF Mono',Menlo,Consolas,'Courier New',monospace;--serif:Georgia,'Times New Roman','Songti SC','STSong',serif}
+*{box-sizing:border-box}
+body{margin:0 auto;padding:22px 20px;background:var(--paper);color:var(--ink);max-width:1300px;
+ font-family:-apple-system,'PingFang SC','Helvetica Neue',sans-serif;font-size:14px;
+ background-image:repeating-linear-gradient(0deg,rgba(79,75,64,.028) 0 1px,transparent 1px 28px)}
+header.tb{border:2px solid var(--rule2);outline:1px solid var(--rule2);outline-offset:3px;background:var(--panel);
+ display:flex;justify-content:space-between;align-items:center;gap:14px;padding:16px 20px;margin-bottom:20px;flex-wrap:wrap}
+.doc{font:600 10px var(--mono);letter-spacing:.28em;color:var(--sub)}
+h1{font:700 23px var(--serif);letter-spacing:.08em;margin:4px 0 5px;color:var(--ink)}
+.subtt{font-size:12px;color:var(--sub);letter-spacing:.06em}
+table.meta{border-collapse:collapse;font:12px var(--mono)}
+table.meta th{font-weight:600;color:var(--sub);text-align:left;padding:3px 12px 3px 0;letter-spacing:.2em;white-space:nowrap}
+table.meta td{padding:3px 0;border-bottom:1px dotted var(--rule);white-space:nowrap}
+main{display:grid;grid-template-columns:430px 1fr;gap:18px;align-items:start}
+@media(max-width:1020px){main{grid-template-columns:1fr}}
+.panel{background:var(--panel);border:1px solid var(--rule2);box-shadow:3px 3px 0 rgba(70,64,52,.14);margin-bottom:16px}
+.panel h2{margin:0;padding:8px 12px;border-bottom:1px solid var(--rule2);display:flex;align-items:center;gap:9px;
+ font:700 13.5px var(--serif);letter-spacing:.14em;background:linear-gradient(#f0ecdc,#e7e1cd)}
+.panel h2 .no{font:700 10.5px var(--mono);color:#f6f3e8;background:var(--rule2);padding:2px 6px;letter-spacing:.1em}
+.panel h2 .en{font:400 9.5px var(--mono);color:var(--sub);letter-spacing:.24em}
+.panel h2 .hr{margin-left:auto;display:flex;gap:5px;align-items:center;font-weight:400;letter-spacing:0}
+.pb{padding:13px 14px}
+button{font-family:inherit;font-size:13.5px;font-weight:600;letter-spacing:.05em;color:var(--ink);
+ background:#f0ecdd;border:1.5px solid var(--rule2);border-radius:2px;padding:9px 15px;cursor:pointer;
+ box-shadow:2px 2px 0 rgba(70,64,52,.28);margin:2px 6px 2px 0}
+button:hover{background:var(--navy);border-color:var(--navy);color:#f2eee0}
+button:active{transform:translate(2px,2px);box-shadow:none}
+button:disabled{opacity:.38;cursor:default;box-shadow:none;transform:none}
+button.primary{background:var(--navy);border-color:#152c49;color:#f2eee0}
+button.primary:hover{background:#16304f}
+button.warn{border-color:var(--amber);color:var(--amber);background:#f4efdc}
+button.warn:hover{background:var(--amber);border-color:var(--amber);color:#fff}
+button.danger{background:var(--red);border-color:#611712;color:#f7efe5}
+button.danger:hover{background:#7f1f19;border-color:#611712}
+button.estop{display:block;width:100%;margin:12px 0 0;background:var(--red);border:2px solid #5c1611;color:#fff;
+ font-size:15px;letter-spacing:.5em;padding:13px;text-indent:.5em}
+.steps{display:grid;gap:9px;margin-top:4px}
+.steps button{width:100%;text-align:left;margin:0}
+.steps .bn{font-family:var(--serif);font-weight:700;margin-right:7px}
+.steps .bs{display:block;font-weight:400;font-size:11px;opacity:.75;letter-spacing:.03em;margin-top:3px}
+.badge{display:inline-block;border:1px solid;padding:2px 8px;font:700 11.5px var(--mono);letter-spacing:.06em;background:transparent}
+.FOLLOW{color:var(--green);border-color:var(--green);background:rgba(46,107,60,.08)}
+.HOLD,.STEER_ONLY{color:var(--amber);border-color:var(--amber);background:rgba(138,106,43,.08)}
+.STOP_NEAR{color:var(--red);border-color:var(--red);background:rgba(156,43,35,.08)}
+.SEARCH{color:var(--violet);border-color:var(--violet);background:rgba(91,74,138,.08)}
+.COAST,.RETURN{color:var(--blue);border-color:var(--blue);background:rgba(43,93,138,.08)}
+.SEEK{color:var(--amber);border-color:var(--amber);background:rgba(138,106,43,.08)}
+.OFF{color:var(--gray);border-color:var(--gray)}
+.k{font-size:10.5px;color:var(--sub);letter-spacing:.08em}
+.grid{display:grid;gap:7px;margin-top:9px}
+.g3{grid-template-columns:repeat(3,1fr)}.g4{grid-template-columns:repeat(4,1fr)}
+.kv{border:1px solid var(--rule);background:#faf7ec;padding:7px 9px}
+.kv .v{font:600 19px var(--mono);margin-top:2px;color:var(--ink);white-space:nowrap}
+.frow{display:flex;align-items:center;gap:8px;margin:10px 0;flex-wrap:wrap}
+.fl{font:600 12px var(--serif);letter-spacing:.14em;min-width:64px}
+.fu{font:11.5px var(--mono);color:var(--sub)}
+input[type=number]{width:74px;font:600 14px var(--mono);padding:7px;border:1.5px solid var(--rule2);border-radius:2px;background:#fffdf3;color:var(--ink)}
+input[type=number]:focus{outline:2px solid rgba(30,58,95,.3);border-color:var(--navy)}
+input[type=checkbox]{accent-color:var(--navy)}
+label{font-size:13px;margin-right:12px;cursor:pointer}
+.note{font-size:12px;color:var(--sub);border-left:3px solid var(--rule);padding:3px 9px;margin-top:10px;line-height:1.6}
+.chk{font:11.5px var(--mono);margin-top:10px;color:var(--sub);border:1px dashed var(--rule2);padding:7px 9px;letter-spacing:.04em}
+.console{font:12px var(--mono);background:#26261f;color:#d8d1ba;border:1px solid var(--rule2);
+ padding:9px 11px;min-height:38px;line-height:1.5;box-shadow:3px 3px 0 rgba(70,64,52,.14)}
+.console:before{content:'>> ';color:#8f9e78}
+.sub{font:700 12.5px var(--serif);letter-spacing:.15em;margin:2px 0 8px}
+.subnote{font:400 11px var(--mono);color:var(--sub);letter-spacing:.02em}
+hr.dr{border:0;border-top:1px dashed var(--rule2);margin:13px 0}
+.files{margin-top:8px;font-size:12px;line-height:1.9}
+.mtitle{font:700 12px var(--serif);letter-spacing:.15em;margin:0 0 6px;color:var(--ink);display:flex;justify-content:space-between;align-items:center}
+img{width:100%;border:1px solid var(--rule2);background:#141412;display:block}
+table.data{width:100%;border-collapse:collapse;font:12.5px var(--mono)}
+table.data th{text-align:left;font:600 10.5px var(--mono);letter-spacing:.12em;color:var(--sub);border-bottom:1px solid var(--rule2);padding:4px 6px}
+table.data td{padding:4px 6px;border-bottom:1px dotted var(--rule);color:var(--ink)}
+footer{grid-column:1/-1;text-align:center;font:10.5px var(--mono);letter-spacing:.22em;color:var(--sub);
+ border-top:1px solid var(--rule);margin-top:6px;padding-top:12px}
+a{color:var(--navy)}
+</style></head><body>
 
-<div class=card><div class=k style=margin-bottom:8px>电池 · BMS 实时</div>
-<div style="display:flex;align-items:center;gap:14px">
-<div style="font-size:32px;font-weight:750;min-width:86px;font-variant-numeric:tabular-nums" id=bsoc>—</div>
-<div style="flex:1">
-<div style="background:#eef2f7;border-radius:6px;height:14px;overflow:hidden"><div id=bbar style="height:100%;width:0%;background:#16a34a;transition:width .4s"></div></div>
-<div class=k id=bdetail style=margin-top:6px>—</div></div></div>
-<div class=grid style="margin-top:10px;grid-template-columns:repeat(4,1fr)">
-<div class=kv><div class=k>电压 V</div><div class=v id=bvolt>—</div></div>
-<div class=kv><div class=k>电流 A</div><div class=v id=bamp>—</div></div>
-<div class=kv><div class=k>剩余 Ah</div><div class=v id=bah>—</div></div>
-<div class=kv><div class=k>状态</div><div class=v id=bchg style=font-size:15px>—</div></div>
-</div></div>
+<header class=tb>
+<div>
+<div class=doc>PERSON-FOLLOWING ROBOT · EXPERIMENT CONSOLE</div>
+<h1>视觉跟随机器人 · 实验控制台</h1>
+<div class=subtt>双目立体视觉 — YOLOv5s·TensorRT 检测 — OSNet 行人重识别 — CAN 底盘控制</div>
+</div>
+<table class=meta>
+<tr><th>修 订</th><td>REV.9 / 2026-07-15</td></tr>
+<tr><th>平 台</th><td>Jetson AGX Xavier</td></tr>
+<tr><th>时 钟</th><td id=clk>——</td></tr>
+</table>
+</header>
 
-<div class=card><div class=k style=margin-bottom:8px>小车跟随人 · 实时状态</div>
-<div style="font-size:15px;margin-bottom:10px">状态 <span id=fstate class="badge OFF">OFF</span>
-<span id=farm style="margin-left:10px;color:#8e8e93;font-size:13px"></span></div>
-<div class=grid>
-<div class=kv><div class=k>目标距离 m (保持2-4)</div><div class=v id=fdist>—</div></div>
-<div class=kv><div class=k>横向偏移 m (右+)</div><div class=v id=flat>—</div></div>
-<div class=kv><div class=k>下发车速 m/s</div><div class=v id=fspeed>—</div></div>
-<div class=kv><div class=k>下发转向 °</div><div class=v id=fsteer>—</div></div>
-<div class=kv><div class=k>相机 fps</div><div class=v id=cfps>—</div></div>
-<div class=kv><div class=k>视差 fps</div><div class=v id=dfps>—</div></div>
-<div class=kv><div class=k>置信度 %</div><div class=v id=fconf>—</div></div>
-<div class=kv><div class=k>光照 (0~255)</div><div class=v id=clux>—</div></div>
-</div></div>
+<main>
+<div>
 
-<div class=card><div class=k style=margin-bottom:8px>控制台</div>
-<div style="margin-bottom:7px;font-size:13px">感知 <span id=cgrab class="badge OFF">grabber</span> <span id=cyolo class="badge OFF">yolo</span></div>
-<button id=pson onclick="go('perception_start')" style="background:#2563eb;padding:11px 16px;font-size:15px">▶ 启动感知</button>
-<button id=psoff onclick="go('perception_stop')" style="background:#94a3b8;padding:11px 16px;font-size:15px">■ 停止感知</button>
-<div style="margin:13px 0 7px;font-size:13px">跟随控制 <span id=cfollow class="badge OFF">未运行</span></div>
-<button id=fdry onclick="go('follow_dry')" style="background:#16a34a;padding:11px 16px;font-size:15px">▶ DRY-RUN</button>
-<button id=fsteer onclick="steerConfirm()" style="background:#fbbf24;color:#78350f;padding:11px 16px;font-size:15px">↔ 转向跟随(不前进)</button>
-<button id=farmbtn onclick="armConfirm()" style="background:#f97316;padding:11px 16px;font-size:15px">⚡ ARM 前进+转向</button>
-<button id=fstopbtn onclick="go('follow_stop')" style="background:#dc2626;padding:11px 16px;font-size:15px">■ 停止/急停</button>
-<div style="margin:13px 0 7px;font-size:13px">保持距离 m (热生效)</div>
-<input id=dmin type=number step=0.5 min=0.5 value=2> ~
-<input id=dmax type=number step=0.5 value=4>
-<button onclick="setDist()" style="background:#7c3aed;padding:9px 16px;font-size:15px">设置</button>
-<div style="margin:13px 0 7px;font-size:13px">最高速度 m/s (≤2.2=硬件上限, 热生效) <span id=vcur style="color:#64748b"></span></div>
-<input id=vmax type=number step=0.1 min=0.1 max=2.2 value=0.4>
-<button onclick="setSpeed()" style="background:#7c3aed;padding:9px 16px;font-size:15px">设置</button>
-<div style="margin:13px 0 7px;font-size:13px">模式开关 (热生效)</div>
-<label style="font-size:14px;margin-right:16px"><input id=mgrass type=checkbox onchange="setMode()"> 草地模式 (最低驱动 0.5)</label>
-<label style="font-size:14px"><input id=mseek type=checkbox onchange="setMode()"> 丢失寻回 (满舵找人+倒车归位)</label>
-<div class=k id=ctlmsg style=margin-top:8px>ARM 前务必: 车轮架空 / 充电枪拔出 / 急停释放</div></div>
+<section class=panel><h2><span class=no>01</span>感知系统<span class=en>PERCEPTION</span>
+<span class=hr><span id=cgrab class="badge OFF">grabber</span><span id=cyolo class="badge OFF">yolo</span><span id=csel class="badge OFF">选择器</span></span></h2>
+<div class=pb>
+<button class=primary onclick="go('perception_start')">▶ 启动感知</button>
+<button onclick="go('perception_stop')">■ 停止感知</button>
+<div class=note>依次拉起 相机采集 → YOLO 检测 → ReID 选择器。三灯全绿后右侧监视器应有画面。</div>
+</div></section>
 
-<div class=card><div class=k style=margin-bottom:8px>Demo 视频 (左侧数据栏 + YOLO框, 直接烧进画面)</div>
-<button id=demostart onclick="go('demo_start')" style="background:#e11d48;padding:11px 16px;font-size:15px">⏺ 录制 Demo</button>
-<button id=demostop onclick="go('demo_stop')" disabled style="background:#94a3b8;padding:11px 16px;font-size:15px">⏹ 停止并保存</button>
-<span id=demostat style="margin-left:10px;color:#64748b;font-size:13px"></span>
-<div id=demolist style="margin-top:9px;font-size:13px"></div></div>
+<section class=panel><h2><span class=no>02</span>目标锁定<span class=en>TARGET LOCK · ReID</span>
+<span class=hr><span id=clock class="badge OFF">未锁定</span></span></h2>
+<div class=pb>
+<button class=primary onclick="lockConfirm()">🔒 锁定我为主人</button>
+<button onclick="go('unlock')">🔓 解锁</button>
+<div class=note>本人站于相机前(绿框框住自己)再锁定。锁定后仅跟随注册者;画面中其他人以灰色虚线框标注外观相似度,不参与跟随。解锁即恢复「跟最显著者」。</div>
+</div></section>
 
-<div class=card><div style="margin-bottom:10px"><span id=dot style="color:#8e8e93">●</span> <span id=stext>空闲</span></div>
+<section class=panel><h2><span class=no>03</span>跟随控制<span class=en>FOLLOW CONTROL</span>
+<span class=hr><span id=cfollow class="badge OFF">未运行</span></span></h2>
+<div class=pb>
+<div class=steps>
+<button onclick="go('follow_dry')"><span class=bn>Ⅰ</span>DRY-RUN 试运行<span class=bs>只计算决策,不发 CAN 帧 — 绝对安全,先看决策对不对</span></button>
+<button class=warn onclick="steerConfirm()"><span class=bn>Ⅱ</span>仅转向跟随<span class=bs>速度锁 0,车不前进,只打方向轮 — 需急停释放</span></button>
+<button class=danger onclick="armConfirm()"><span class=bn>Ⅲ</span>ARM 正式跟随<span class=bs>真发帧控车 — 须完成下方检查单并二次确认</span></button>
+</div>
+<button class=estop onclick="go('follow_stop')">■ 停止 / 急停</button>
+<div class=chk>ARM 前置检查单 □ 车轮架空 □ 充电枪已拔 □ 急停已释放 □ 场地清空</div>
+</div></section>
+
+<section class=panel><h2><span class=no>04</span>参数整定<span class=en>PARAMETERS · 热生效</span></h2>
+<div class=pb>
+<div class=frow><span class=fl>保持距离</span><input id=dmin type=number step=0.5 min=0.5 value=2> —
+<input id=dmax type=number step=0.5 value=4><span class=fu>m</span><button onclick="setDist()">设 定</button></div>
+<div class=frow><span class=fl>速度上限</span><input id=vmax type=number step=0.1 min=0.1 max=2.2 value=0.4>
+<span class=fu>m/s (≤2.2 硬件上限)</span><button onclick="setSpeed()">设 定</button><span id=vcur class=fu></span></div>
+<div class=frow><span class=fl>模 式</span>
+<label><input id=mgrass type=checkbox onchange="setMode()"> 草地模式 (最低驱动 0.5)</label>
+<label><input id=mseek type=checkbox onchange="setMode()"> 丢失寻回 (满舵找人+倒车归位)</label></div>
+</div></section>
+
+<section class=panel><h2><span class=no>05</span>记录<span class=en>RECORDING</span></h2>
+<div class=pb>
+<div class=sub>DEMO 视频 <span class=subnote>数据栏 + 锁定/候选框直接烧进画面</span></div>
+<button id=demostart onclick="go('demo_start')">⏺ 录制 Demo</button>
+<button id=demostop onclick="go('demo_stop')" disabled>⏹ 停止并保存</button>
+<span id=demostat class=fu></span>
+<div id=demolist class=files></div>
+<hr class=dr>
+<div class=sub>数据集记录 <span class=subnote><span id=dot style="color:#857f70">●</span> <span id=stext>空闲</span></span></div>
 <button id=start onclick="go('start')">▶ 开始记录</button>
 <button id=stop onclick="go('stop')" disabled>■ 结束记录</button>
-<div class=k id=msg style=margin-top:8px></div>
-<div class=grid style=margin-top:10px>
-<div class=kv><div class=k>run</div><div class=v id=run>—</div></div>
+<div class=k id=msg style=margin-top:6px></div>
+<div class="grid g3">
+<div class=kv><div class=k>RUN</div><div class=v id=run>—</div></div>
 <div class=kv><div class=k>图像帧</div><div class=v id=frames>—</div></div>
 <div class=kv><div class=k>视差帧</div><div class=v id=depth>—</div></div>
 <div class=kv><div class=k>障碍物行</div><div class=v id=obsrows>—</div></div>
 <div class=kv><div class=k>时长 s</div><div class=v id=elapsed>—</div></div>
 <div class=kv><div class=k>磁盘 GB</div><div class=v id=disk>—</div></div>
-</div></div>
+</div>
+</div></section>
 
-<div class=card><div class=k style=margin-bottom:8px>当前障碍物 (相机自带检测)</div>
-<table id=obstab><tr><th>类型</th><th>距离 m</th><th>横向 m</th></tr></table></div>
+<div id=ctlmsg class=console>ARM 前务必: 车轮架空 / 充电枪拔出 / 急停释放</div>
+</div>
 
-<div class="card wide"><div class=grid style="grid-template-columns:1fr 1fr">
-<div><div class=k style=margin-bottom:6px>左目 (实时 + YOLO框)
-<label style="margin-left:10px;cursor:pointer;color:#334155;font-size:12px"><input type=checkbox id=ovlchk style="vertical-align:-2px" onchange="localStorage.setItem('ovl',this.checked?'1':'0')"> 叠加速度/转向</label></div>
+<div>
+<section class=panel><h2><span class=no>A</span>遥测<span class=en>TELEMETRY</span>
+<span class=hr><span id=fstate class="badge OFF">OFF</span></span></h2>
+<div class=pb>
+<div style="font:12px var(--mono);color:var(--sub)" id=farm>控制器未运行</div>
+<div class="grid g4">
+<div class=kv><div class=k>目标距离 m</div><div class=v id=fdist>—</div></div>
+<div class=kv><div class=k>横向偏移 m</div><div class=v id=flat>—</div></div>
+<div class=kv><div class=k>下发车速 m/s</div><div class=v id=fspeed>—</div></div>
+<div class=kv><div class=k>下发转向 °</div><div class=v id=fsteer>—</div></div>
+<div class=kv><div class=k>相机 fps</div><div class=v id=cfps>—</div></div>
+<div class=kv><div class=k>视差 fps</div><div class=v id=dfps>—</div></div>
+<div class=kv><div class=k>置信度 %</div><div class=v id=fconf>—</div></div>
+<div class=kv><div class=k>光照 0–255</div><div class=v id=clux>—</div></div>
+</div>
+</div></section>
+
+<section class=panel><h2><span class=no>B</span>监视器<span class=en>MONITOR</span></h2>
+<div class=pb>
+<div class=mtitle>左目 · YOLO / ReID 标注
+<label class=fu style="letter-spacing:0"><input type=checkbox id=ovlchk onchange="localStorage.setItem('ovl',this.checked?'1':'0')"> 叠加速度/转向</label></div>
 <div id=prevwrap style="position:relative;line-height:0">
-<img id=prev src="/stream" style="width:100%;border-radius:9px;background:#000;display:block">
+<img id=prev src="/stream">
+<div id=cands style="position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none"></div>
 <div id=ybox style="position:absolute;border:2px solid #30d158;box-shadow:0 0 0 1px rgba(0,0,0,.6);display:none;pointer-events:none"></div>
-<div id=ylabel style="position:absolute;background:#30d158;color:#000;font-size:11px;font-weight:700;padding:1px 5px;border-radius:3px;display:none;pointer-events:none;white-space:nowrap"></div>
-<div id=ovl style="position:absolute;left:8px;top:8px;background:rgba(15,23,42,.62);color:#fff;padding:7px 11px;border-radius:9px;font-size:13px;line-height:1.65;display:none;pointer-events:none;white-space:nowrap;font-variant-numeric:tabular-nums"></div>
-</div></div>
-<div><div class=k style=margin-bottom:6px>视差 (实时)</div><img id=disp src="/dispstream"></div>
-</div></div>
+<div id=ylabel style="position:absolute;background:#30d158;color:#000;font-size:11px;font-weight:700;padding:1px 5px;display:none;pointer-events:none;white-space:nowrap"></div>
+<div id=ovl style="position:absolute;left:8px;top:8px;background:rgba(20,20,16,.68);color:#f0ecdd;padding:7px 11px;font-size:13px;line-height:1.65;display:none;pointer-events:none;white-space:nowrap;font-variant-numeric:tabular-nums"></div>
+</div>
+<div class=mtitle style="margin-top:12px">视差图 · 伪彩</div>
+<img id=disp src="/dispstream">
+</div></section>
+
+<section class=panel><h2><span class=no>C</span>电源<span class=en>POWER · BMS</span>
+<span class=hr><span id=bchg class="badge OFF">—</span></span></h2>
+<div class=pb>
+<div style="display:flex;align-items:center;gap:16px">
+<div style="font:700 30px var(--mono);min-width:92px" id=bsoc>—</div>
+<div style="flex:1">
+<div style="background:#ddd6c2;border:1px solid var(--rule2);height:15px"><div id=bbar style="height:100%;width:0%;background:#2e6b3c;transition:width .4s"></div></div>
+<div class=k id=bdetail style=margin-top:5px>—</div></div></div>
+<div class="grid g3">
+<div class=kv><div class=k>电压 V</div><div class=v id=bvolt>—</div></div>
+<div class=kv><div class=k>电流 A</div><div class=v id=bamp>—</div></div>
+<div class=kv><div class=k>剩余 Ah</div><div class=v id=bah>—</div></div>
+</div>
+</div></section>
+
+<section class=panel><h2><span class=no>D</span>障碍物<span class=en>OBSTACLES · 相机自带</span></h2>
+<div class=pb>
+<table class=data id=obstab><tr><th>类型</th><th>距离 m</th><th>横向 m</th></tr></table>
+</div></section>
+</div>
+
+<footer>FOLLOW ROBOT PLATFORM · 控制回路 40 Hz · CAN 50 Hz · 面板轮询 1 Hz · ARM 操作须遵守检查单</footer>
+</main>
 
 <script>
 function go(a){fetch('/'+a,{method:'POST'}).then(r=>r.json()).then(j=>{document.getElementById('ctlmsg').textContent=(j.msg||j.result||JSON.stringify(j));tick();}).catch(e=>{document.getElementById('ctlmsg').textContent=''+e;tick();});}
@@ -975,22 +1190,22 @@ function setSpeed(){var v=parseFloat(document.getElementById('vmax').value);
 function tick(){fetch('/status').then(r=>r.json()).then(s=>{
  var rec=s.recording, f=s.follow||{}, c=s.camera||{};
  var st=f.state||'OFF'; var b=document.getElementById('fstate'); b.textContent=st; b.className='badge '+st;
- document.getElementById('farm').textContent=f.running?(f.armed?'ARMED 真发帧':'dry-run 不发帧'):'控制器未运行';
+ document.getElementById('farm').textContent=f.running?(f.armed?'ARMED — 真发帧控车':'DRY-RUN — 不发帧'):'控制器未运行';
  document.getElementById('fdist').textContent=(f.dist_m==null?'—':f.dist_m);
  document.getElementById('flat').textContent=(f.lateral_m==null?'—':f.lateral_m);
  document.getElementById('fspeed').textContent=(f.cmd_speed==null?'—':f.cmd_speed);
  document.getElementById('fsteer').textContent=(f.cmd_steer==null?'—':f.cmd_steer);
  document.getElementById('cfps').textContent=c.left_fps||0;document.getElementById('dfps').textContent=c.disparity_fps||0;
  var tg0=s.target||{};document.getElementById('fconf').textContent=(tg0.conf!=null?Math.round(tg0.conf*100):'—');
- var lx=c.brightness;document.getElementById('clux').textContent=(lx!=null?lx+(lx<60?' 偏暗':(lx>190?' 偏亮':' 正常')):'—');
+ var lx=c.brightness;document.getElementById('clux').textContent=(lx!=null?lx+(lx<60?' 暗':(lx>190?' 亮':'')):'—');
  var ov=document.getElementById('ovl'),oc=document.getElementById('ovlchk');
  if(oc&&oc.checked){ov.style.display='block';
-  var zh={FOLLOW:'跟随',HOLD:'保持',STOP_NEAR:'太近停',SEARCH:'搜索',COAST:'滑行',STEER_ONLY:'仅转向',OFF:'停止'};
+  var zh={FOLLOW:'跟随',HOLD:'保持',STOP_NEAR:'太近停',SEARCH:'搜索',COAST:'滑行',STEER_ONLY:'仅转向',SEEK:'寻回',RETURN:'归位',OFF:'停止'};
   var vmax=(f.max_speed!=null?f.max_speed:0.4);
   var sp=(f.cmd_speed!=null?f.cmd_speed:null),stv=(f.cmd_steer!=null?f.cmd_steer:null),la=(f.lateral_m!=null?f.lateral_m:null);
-  function bar(r,color){return '<span style="position:relative;width:96px;height:8px;background:rgba(148,163,184,.3);border-radius:4px;display:inline-block;margin-left:6px"><span style="position:absolute;left:0;width:'+Math.round(Math.max(0,Math.min(1,r))*100)+'%;height:100%;background:'+color+';border-radius:4px"></span></span>';}
+  function bar(r,color){return '<span style="position:relative;width:96px;height:8px;background:rgba(148,163,184,.3);display:inline-block;margin-left:6px"><span style="position:absolute;left:0;width:'+Math.round(Math.max(0,Math.min(1,r))*100)+'%;height:100%;background:'+color+'"></span></span>';}
   function cbar(r,color){r=Math.max(-1,Math.min(1,r));var w=Math.abs(r)*50,left=r<0?(50-w):50;
-   return '<span style="position:relative;width:96px;height:8px;background:rgba(148,163,184,.3);border-radius:4px;display:inline-block;margin-left:6px"><span style="position:absolute;left:'+left+'%;width:'+w+'%;height:100%;background:'+color+';border-radius:4px"></span><span style="position:absolute;left:50%;top:-2px;width:1px;height:12px;background:#cbd5e1"></span></span>';}
+   return '<span style="position:relative;width:96px;height:8px;background:rgba(148,163,184,.3);display:inline-block;margin-left:6px"><span style="position:absolute;left:'+left+'%;width:'+w+'%;height:100%;background:'+color+'"></span><span style="position:absolute;left:50%;top:-2px;width:1px;height:12px;background:#cbd5e1"></span></span>';}
   ov.innerHTML='<div style="font-weight:700;margin-bottom:4px">'+(zh[f.state]||'—')+(f.dist_m!=null?' · '+f.dist_m.toFixed(2)+' m':'')+'</div>'
    +'<div>速 '+(sp!=null?sp.toFixed(2):'—')+bar(sp!=null?sp/vmax:0,'#22d3ee')+'</div>'
    +'<div>转 '+(stv!=null?((stv>0?'+':'')+stv.toFixed(1)):'—')+cbar(stv!=null?stv/25:0,'#f59e0b')+'</div>'
@@ -998,20 +1213,27 @@ function tick(){fetch('/status').then(r=>r.json()).then(s=>{
  }else{ov.style.display='none';}
  var ctl=s.ctl||{};var sb=function(id,on,t){var e=document.getElementById(id);if(!e)return;e.textContent=t;e.className='badge '+(on?'FOLLOW':'OFF');};
  sb('cgrab',ctl.grabber,'grabber'+(ctl.grabber?' ✓':' ✕'));sb('cyolo',ctl.yolo,'yolo'+(ctl.yolo?' ✓':' ✕'));
- var cf=document.getElementById('cfollow');if(cf){if(ctl.follow_running){cf.textContent=ctl.armed?'ARMED ⚡':'dry-run';cf.className='badge '+(ctl.armed?'STOP_NEAR':'HOLD');}else{cf.textContent='未运行';cf.className='badge OFF';}}
- var b=s.bms||{};
- if(b.voltage_v!=null){var soc=(b.soc_pct==null?0:b.soc_pct);
+ sb('csel',ctl.selector,'选择器'+(ctl.selector?' ✓':' ✕'));
+ var tg1=s.target||{},lk=document.getElementById('clock');
+ if(lk){var zhT={TRACKING:'跟踪中',REACQ:'重捕获中',LOST:'目标丢失',NEED_ENROLL:'待注册'};
+  if(tg1.locked){lk.textContent='🔒 '+(zhT[tg1.track]||'已锁定')+(tg1.lock_conf!=null?' 像'+(tg1.lock_conf*100).toFixed(0)+'%':'');
+   lk.className='badge '+(tg1.track==='TRACKING'?'FOLLOW':(tg1.track==='LOST'?'STOP_NEAR':'HOLD'));}
+  else{lk.textContent='未锁定 (跟最显著的人)';lk.className='badge OFF';}}
+ var cf=document.getElementById('cfollow');if(cf){if(ctl.follow_running){cf.textContent=ctl.armed?'ARMED ⚡':'DRY-RUN';cf.className='badge '+(ctl.armed?'STOP_NEAR':'HOLD');}else{cf.textContent='未运行';cf.className='badge OFF';}}
+ var b2=s.bms||{};
+ if(b2.voltage_v!=null){var soc=(b2.soc_pct==null?0:b2.soc_pct);
   document.getElementById('bsoc').textContent=soc+'%';
-  var bar=document.getElementById('bbar');bar.style.width=soc+'%';
-  bar.style.background=b.charging?'#2563eb':(soc<20?'#dc2626':(soc<40?'#d97706':'#16a34a'));
-  document.getElementById('bdetail').textContent='SOC 按电压估算(39~54.6V 线性), 充电时略偏高';
-  document.getElementById('bvolt').textContent=b.voltage_v;
-  document.getElementById('bamp').textContent=(b.current_a>0?'+':'')+b.current_a;
-  document.getElementById('bah').textContent=b.remaining_ah;
-  var bc=document.getElementById('bchg');bc.textContent=b.charging?'充电中':'放电';bc.style.color=b.charging?'#2563eb':'#334155';
+  var bar2=document.getElementById('bbar');bar2.style.width=soc+'%';
+  bar2.style.background=b2.charging?'#2b5d8a':(soc<20?'#9c2b23':(soc<40?'#8a6a2b':'#2e6b3c'));
+  document.getElementById('bdetail').textContent='SOC 为电压线性估算 (39–54.6V), 充电时略偏高';
+  document.getElementById('bvolt').textContent=b2.voltage_v;
+  document.getElementById('bamp').textContent=(b2.current_a>0?'+':'')+b2.current_a;
+  document.getElementById('bah').textContent=b2.remaining_ah;
+  var bc=document.getElementById('bchg');bc.textContent=b2.charging?'充电中':'放电';bc.className='badge '+(b2.charging?'COAST':'FOLLOW');
  }else{document.getElementById('bsoc').textContent='—';document.getElementById('bdetail').textContent='无 BMS 数据';
-  ['bvolt','bamp','bah','bchg'].forEach(function(i){document.getElementById(i).textContent='—';});}
- document.getElementById('dot').style.color=rec?'#ff453a':'#8e8e93';document.getElementById('stext').textContent=rec?'录制中…':'空闲';
+  ['bvolt','bamp','bah'].forEach(function(i){document.getElementById(i).textContent='—';});
+  var bc0=document.getElementById('bchg');bc0.textContent='—';bc0.className='badge OFF';}
+ document.getElementById('dot').style.color=rec?'#9c2b23':'#857f70';document.getElementById('stext').textContent=rec?'录制中…':'空闲';
  document.getElementById('start').disabled=rec;document.getElementById('stop').disabled=!rec;
  document.getElementById('run').textContent=s.run||'—';
  document.getElementById('frames').textContent=rec?(s.frames||0):'—';document.getElementById('depth').textContent=rec?(s.depth_frames||0):'—';
@@ -1024,7 +1246,7 @@ function tick(){fetch('/status').then(r=>r.json()).then(s=>{
  document.getElementById('demostop').disabled=!dm.recording;
  document.getElementById('demostat').textContent=dm.recording?('⏺ '+(dm.file||'启动中…')+' · '+(dm.frames||0)+'帧 · '+(dm.elapsed||0)+'s'):(dm.error?('错误: '+dm.error):'');
  var dl=document.getElementById('demolist');dl.innerHTML='';
- (s.demos||[]).forEach(function(d){var a=document.createElement('a');a.href='/demo?f='+encodeURIComponent(d.name);a.textContent=d.name+' ('+d.mb+'MB)';a.style.cssText='color:#0a84ff;display:inline-block;margin-right:12px';dl.appendChild(a);});
+ (s.demos||[]).forEach(function(d){var a=document.createElement('a');a.href='/demo?f='+encodeURIComponent(d.name);a.textContent=d.name+' ('+d.mb+'MB)';a.style.cssText='color:#1e3a5f;display:inline-block;margin-right:14px';dl.appendChild(a);});
  var vm=(f.max_speed!=null)?f.max_speed:((s.config||{}).max_speed);
  document.getElementById('vcur').textContent=(vm!=null)?('当前 '+vm):'当前 0.4 (默认)';
  var cfg=s.config||{};
@@ -1034,15 +1256,36 @@ function tick(){fetch('/status').then(r=>r.json()).then(s=>{
 }).catch(e=>{});}
 function setMode(){var g=document.getElementById('mgrass').checked?1:0,k=document.getElementById('mseek').checked?1:0;
  fetch('/set_mode?grass='+g+'&seek='+k,{method:'POST'}).then(r=>r.json()).then(j=>{document.getElementById('ctlmsg').textContent=(j.msg||'');}).catch(e=>{});}
-function drawBox(tg){var pv=document.getElementById('prev'),yb=document.getElementById('ybox'),yl=document.getElementById('ylabel');
- if(tg&&tg.bbox&&tg.img_w&&pv.clientWidth>0){var sx=pv.clientWidth/tg.img_w,sy=pv.clientHeight/tg.img_h;
+function lockConfirm(){if(confirm('把画面里最显著的那个人锁定为「主人」?\\n锁定后只跟他, 路人再近也不跟。'))go('lock');}
+function drawBox(tg){var pv=document.getElementById('prev'),yb=document.getElementById('ybox'),yl=document.getElementById('ylabel'),cd=document.getElementById('cands');
+ var sx=0,sy=0;
+ if(tg&&tg.img_w&&pv.clientWidth>0){sx=pv.clientWidth/tg.img_w;sy=pv.clientHeight/tg.img_h;}
+ if(cd){cd.innerHTML='';
+  if(tg&&tg.candidates&&sx>0){tg.candidates.forEach(function(c){
+   if(!c.bbox)return;
+   if(tg.bbox&&Math.abs(c.bbox[0]-tg.bbox[0])<2&&Math.abs(c.bbox[1]-tg.bbox[1])<2)return;
+   var d=document.createElement('div');
+   d.style.cssText='position:absolute;border:1.5px dashed rgba(148,163,184,.85);left:'+(c.bbox[0]*sx)+'px;top:'+(c.bbox[1]*sy)+'px;width:'+(c.bbox[2]*sx)+'px;height:'+(c.bbox[3]*sy)+'px';
+   cd.appendChild(d);
+   if(c.app!=null){var t=document.createElement('div');
+    t.style.cssText='position:absolute;background:rgba(100,116,139,.9);color:#fff;font-size:10px;font-weight:600;padding:0 3px;left:'+(c.bbox[0]*sx)+'px;top:'+Math.max(0,c.bbox[1]*sy-13)+'px';
+    t.textContent='像 '+(c.app*100).toFixed(0)+'%';cd.appendChild(t);}
+  });}}
+ if(tg&&tg.bbox&&sx>0){
   var bx=tg.bbox[0]*sx,by=tg.bbox[1]*sy,bw=tg.bbox[2]*sx,bh=tg.bbox[3]*sy;
+  var col=tg.locked?'#22c55e':'#30d158';
   yb.style.left=bx+'px';yb.style.top=by+'px';yb.style.width=bw+'px';yb.style.height=bh+'px';yb.style.display='block';
-  yl.style.left=bx+'px';yl.style.top=Math.max(0,by-15)+'px';yl.style.display='block';
-  yl.textContent='人 '+(tg.dist_m!=null?tg.dist_m.toFixed(2)+'m':'')+(tg.conf!=null?' · '+(tg.conf*100).toFixed(0)+'%':'');
+  yb.style.borderColor=col;yb.style.borderWidth=tg.locked?'3px':'2px';
+  yl.style.left=bx+'px';yl.style.top=Math.max(0,by-15)+'px';yl.style.display='block';yl.style.background=col;
+  yl.textContent=(tg.locked?'🔒 主人 ':'人 ')+(tg.dist_m!=null?tg.dist_m.toFixed(2)+'m':'')
+   +(tg.conf!=null?' · '+(tg.conf*100).toFixed(0)+'%':'')
+   +(tg.lock_conf!=null?' · 像'+(tg.lock_conf*100).toFixed(0)+'%':'');
  }else{yb.style.display='none';yl.style.display='none';}}
+function clkTick(){var d=new Date(),p=function(x){return (x<10?'0':'')+x};
+ document.getElementById('clk').textContent=d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());}
 document.getElementById('ovlchk').checked=(localStorage.getItem('ovl')==='1');
 setInterval(tick,1000);tick();
+setInterval(clkTick,1000);clkTick();
 setInterval(function(){fetch('/target').then(r=>r.json()).then(drawBox).catch(e=>{});},300);
 </script></body></html>"""
 
@@ -1150,6 +1393,10 @@ class H(BaseHTTPRequestHandler):
                     '开' if cfg.get('grass') else '关', '开' if cfg.get('seek') else '关'))
             except Exception as e:
                 j(False, '设置失败: %s' % e)
+        elif p.startswith('/lock'):
+            ok, m = set_lock(True); j(ok, m)
+        elif p.startswith('/unlock'):
+            ok, m = set_lock(False); j(ok, m)
         elif p.startswith('/follow_dry'):
             ok, m = follow_start(False); j(ok, m)
         elif p.startswith('/follow_arm'):

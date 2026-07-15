@@ -53,8 +53,13 @@ ITEMS = [
     ('chip_dis', '放电',   15, WHITE, True),
     # 相机画面上的目标标签(白字)
     ('tag_person', '目标', 18, WHITE, True),
+    ('tag_owner',  '主人', 18, WHITE, True),
+    # 锁定状态 chips(相机区右上角, 白字, 底色由 cv2 按 track 画)
+    ('chip_lk_track', '锁定跟踪', 15, WHITE, True),
+    ('chip_lk_reacq', '重捕获中', 15, WHITE, True),
+    ('chip_lk_lost',  '目标丢失', 15, WHITE, True),
     # 右侧视图标题
-    ('v_cam',  '相机画面 · YOLO', 15, CAPT, True),
+    ('v_cam',  '相机画面 · YOLO+ReID', 15, CAPT, True),
     ('v_disp', '视差图 · 伪彩',   15, CAPT, True),
 ]
 

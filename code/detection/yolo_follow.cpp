@@ -97,18 +97,50 @@ static double sample_depth_mm(const cv::Mat& depth, const cv::Rect& box) {
     std::nth_element(vals.begin(), vals.begin() + vals.size() / 2, vals.end());
     return (double)vals[vals.size() / 2];
 }
-static void write_atomic(const std::string& runtime, const std::string& json) {
-    std::string tmp = runtime + "/target.json.tmp";
+static void write_atomic(const std::string& path, const std::string& json) {
+    std::string tmp = path + ".tmp";
     std::ofstream o(tmp.c_str());
     o << json;
     o.close();
-    std::rename(tmp.c_str(), (runtime + "/target.json").c_str());
+    std::rename(tmp.c_str(), path.c_str());
+}
+
+// 一个 person 候选(供 target_selector 的 ReID 打分挑主人; 顶层字段仍取最大框, 兼容旧契约)
+struct Cand {
+    cv::Rect r;
+    float conf;
+    double off_x, box_h, dmm;
+};
+static bool cand_area_gt(const Cand& a, const Cand& b) {
+    return (double)a.r.width * a.r.height > (double)b.r.width * b.r.height;
+}
+// 把单个候选写成紧凑 JSON 对象(bbox/conf/off_x/box_h_norm + 有深度给 dist_m/lateral_m)
+static void emit_cand(std::ostringstream& js, const Cand& c, int W, double focus, double lateral_sign) {
+    js << std::setprecision(4)
+       << "{\"bbox\":[" << c.r.x << "," << c.r.y << "," << c.r.width << "," << c.r.height << "]"
+       << ",\"conf\":" << c.conf
+       << ",\"off_x\":" << c.off_x
+       << ",\"box_h_norm\":" << c.box_h;
+    if (c.dmm > 0) {
+        double dist_m = c.dmm / 1000.0;
+        js << std::setprecision(3) << ",\"dist_m\":" << dist_m;
+        if (focus > 0) {
+            double u = c.r.x + c.r.width / 2.0;
+            double lateral_m = lateral_sign * (u - W / 2.0) * dist_m / focus;
+            js << ",\"lateral_m\":" << lateral_m;
+        }
+    }
+    js << "}";
 }
 
 int main(int argc, char** argv) {
     std::string engine_name = argval(argc, argv, "--engine", "yolov5s.engine");
     std::string grab_dir    = argval(argc, argv, "--grab-dir", "/apollo/follow_data/runtime/grab");
     std::string runtime     = argval(argc, argv, "--runtime", "/apollo/follow_data/runtime");
+    // --out: 输出文件名(相对 runtime)。默认 target.json = 旧行为(直接喂 follow_controller, 无 ReID);
+    //        接 target_selector 时传 --out detections.json, 由选择器读候选挑主人再写 target.json。
+    std::string out_name    = argval(argc, argv, "--out", "target.json");
+    int top_n          = atoi(argval(argc, argv, "--top", "6").c_str());  // 输出前 N 个候选
     double hz          = atof(argval(argc, argv, "--hz", "10").c_str());
     double conf        = atof(argval(argc, argv, "--conf", "0.5").c_str());
     double focus_cli   = atof(argval(argc, argv, "--focus", "-1").c_str());
@@ -148,8 +180,10 @@ int main(int argc, char** argv) {
     const std::string status = grab_dir + "/camera_status.json";
     double period = 1.0 / (hz > 0 ? hz : 10.0);
 
+    const std::string out_path = runtime + "/" + out_name;
     std::cerr << "[yolo_follow] engine=" << engine_name << " grab=" << grab_dir
-              << " -> " << runtime << "/target.json @ " << hz << "Hz (conf=" << conf << ")" << std::endl;
+              << " -> " << out_path << " @ " << hz << "Hz (conf=" << conf
+              << ", top=" << top_n << ")" << std::endl;
 
     while (true) {
         double t0 = now_s();
@@ -189,51 +223,63 @@ int main(int argc, char** argv) {
                 js << std::setprecision(3)
                    << "{\"ts\":" << now_s() << ",\"valid\":false,\"source\":\"yolo_trt\",\"n_persons\":0}";
             } else {
-                // 挑最大框 = 目标(最显著的人, 与 Phase2 仿真一致)
-                Yolo::Detection* best = NULL;
-                cv::Rect bestr;
-                double bestArea = -1;
-                for (size_t k = 0; k < persons.size(); k++) {
-                    cv::Rect r = get_rect(img, persons[k]->bbox);
-                    double a = (double)r.width * r.height;
-                    if (a > bestArea) { bestArea = a; best = persons[k]; bestr = r; }
-                }
-                bestr &= cv::Rect(0, 0, W, H);
-                double u = bestr.x + bestr.width / 2.0;
-                double off_x = (u - W / 2.0) / W;          // -0.5..0.5, 右为正
-                double box_h_norm = (double)bestr.height / H;
-
+                // 深度图加载一次, 所有候选共用(采框中心 50% 区域中位数)
                 cv::Mat depth;
                 double dmt = file_mtime(depthp);
                 if (dmt > 0 && now_s() - dmt <= max_age)
                     depth = cv::imread(depthp, CV_LOAD_IMAGE_ANYDEPTH);  // CV_16U, mm
-                double dmm = sample_depth_mm(depth, bestr);
                 double focus = focus_cli > 0 ? focus_cli : read_focus(status);
 
+                // 为每个 person 算候选信息, 再按面积降序(最大框排第一 = 旧「目标」)
+                std::vector<Cand> cs;
+                for (size_t k = 0; k < persons.size(); k++) {
+                    cv::Rect r = get_rect(img, persons[k]->bbox);
+                    r &= cv::Rect(0, 0, W, H);
+                    if (r.width <= 0 || r.height <= 0) continue;
+                    Cand c;
+                    c.r = r; c.conf = persons[k]->conf;
+                    double u = r.x + r.width / 2.0;
+                    c.off_x = (u - W / 2.0) / W;         // -0.5..0.5, 右为正
+                    c.box_h = (double)r.height / H;
+                    c.dmm = sample_depth_mm(depth, r);
+                    cs.push_back(c);
+                }
+                std::sort(cs.begin(), cs.end(), cand_area_gt);
+                if (top_n > 0 && (int)cs.size() > top_n) cs.resize(top_n);
+
+                // 顶层字段 = 最大框(cs[0]), 与旧契约逐字段一致; 供不接选择器时直喂控制器
+                const Cand& best = cs[0];
+                double u0 = best.r.x + best.r.width / 2.0;
                 js << std::setprecision(3) << "{\"ts\":" << now_s()
                    << ",\"valid\":true,\"source\":\"yolo_trt\""
                    << std::setprecision(4)
-                   << ",\"off_x\":" << off_x << ",\"box_h_norm\":" << box_h_norm
-                   << ",\"conf\":" << best->conf
+                   << ",\"off_x\":" << best.off_x << ",\"box_h_norm\":" << best.box_h
+                   << ",\"conf\":" << best.conf
                    << ",\"n_persons\":" << (int)persons.size()
-                   << ",\"bbox\":[" << bestr.x << "," << bestr.y << "," << bestr.width << "," << bestr.height << "]"
+                   << ",\"bbox\":[" << best.r.x << "," << best.r.y << "," << best.r.width << "," << best.r.height << "]"
                    << ",\"img_w\":" << W << ",\"img_h\":" << H;
-                if (dmm > 0) {
-                    double dist_m = dmm / 1000.0;
+                if (best.dmm > 0) {
+                    double dist_m = best.dmm / 1000.0;
                     js << std::setprecision(3) << ",\"dist_m\":" << dist_m;
                     if (focus > 0) {
-                        double lateral_m = lateral_sign * (u - W / 2.0) * dist_m / focus;
+                        double lateral_m = lateral_sign * (u0 - W / 2.0) * dist_m / focus;
                         js << ",\"lateral_m\":" << lateral_m;
                     }
                     js << ",\"depth\":true";
                 } else {
                     js << ",\"depth\":false";
                 }
-                js << "}";
+                // candidates: 供 target_selector 的 ReID 从中挑主人(不接选择器时控制器忽略此字段)
+                js << ",\"candidates\":[";
+                for (size_t k = 0; k < cs.size(); k++) {
+                    if (k) js << ",";
+                    emit_cand(js, cs[k], W, focus, lateral_sign);
+                }
+                js << "]}";
             }
         }
 
-        write_atomic(runtime, js.str());
+        write_atomic(out_path, js.str());
         if (once) { std::cout << js.str() << std::endl; break; }
         double dt = now_s() - t0;
         if (dt < period) std::this_thread::sleep_for(std::chrono::duration<double>(period - dt));
