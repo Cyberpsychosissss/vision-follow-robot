@@ -689,6 +689,38 @@ _DEMO_CSV_HEADER = ('frame,ts,state,armed,steer_only,dist_m,lateral_m,cmd_speed,
                     'locked,track,lock_conf,n_cands\n')   # ReID 列追加在尾部, 老分析脚本列序不变
 
 
+def _demo_write_meta(path_base, meta):
+    """收尾写 demo_xxx.meta.json —— Mac 侧 tools/make_multiview.py 的输入契约。
+
+    有了它, 合成脚本不必硬编码画布布局: 以后谁改了 SIDEBAR_W/VIEW_W/VIEW_H 或 DEMO_FPS,
+    合成端跟着 meta 走就不会对不上。layout 里的四元组直接就是 ffmpeg crop 的 [w,h,x,y]。
+    first/last_frame_ts 与同名 CSV 的 ts 列同源(同一个 time.time() 取值), 手机视频按
+    tools/sync_phone.py 解出的 offset 平移后即可与本视频逐帧对齐。
+    """
+    try:
+        d = {
+            'schema': 1,
+            'name': meta.get('name'), 'video': meta.get('file'), 'csv': meta.get('csv'),
+            'fps': DEMO_FPS, 'frames': meta.get('frames', 0),
+            'start_ts': meta.get('start'), 'end_ts': time.time(),
+            'first_frame_ts': meta.get('first_ts'), 'last_frame_ts': meta.get('last_ts'),
+            'clock': 'unix epoch, 车上系统钟(NTP 同步), 与 /slate 场记板同源',
+            'layout': {                       # ffmpeg crop 参数: [w, h, x, y]
+                'canvas': [SIDEBAR_W + VIEW_W, VIEW_H * 2],
+                'sidebar': [SIDEBAR_W, VIEW_H * 2, 0, 0],
+                'camera': [VIEW_W, VIEW_H, SIDEBAR_W, 0],
+                'disparity': [VIEW_W, VIEW_H, SIDEBAR_W, VIEW_H],
+            },
+        }
+        tmp = path_base + '.meta.json.tmp'
+        with open(tmp, 'w') as fh:
+            json.dump(d, fh, indent=1, ensure_ascii=False)
+        os.replace(tmp, path_base + '.meta.json')
+        meta['meta_file'] = os.path.basename(path_base) + '.meta.json'
+    except Exception:
+        pass          # 写不出 meta 不该拖累录像本身
+
+
 def _demo_loop(path_base, stop_ev, meta):
     """按墙钟 DEMO_FPS 节拍写最新左目帧+叠加层 → 播放即真实速度。独立于跟随/数据采集。
     同名 .csv 每视频帧记一行全量数据(第N帧=第N行, 与画面严格对齐, 供离线分析)。"""
@@ -770,6 +802,12 @@ def _demo_loop(path_base, stop_ev, meta):
                 f = cv2.resize(f, size)
             writer.write(f)
             meta['frames'] = meta.get('frames', 0) + 1
+            # 本帧墙钟: CSV 的 ts 列与 meta 的 first/last_frame_ts 必须同源同值,
+            # 否则多视角对齐会差半帧 —— 所以只取一次 time.time()
+            row_ts = time.time()
+            if meta['frames'] == 1:
+                meta['first_ts'] = row_ts
+            meta['last_ts'] = row_ts
             if log_f is not None:
                 try:
                     try:
@@ -778,7 +816,7 @@ def _demo_loop(path_base, stop_ev, meta):
                         lux = None
                     des = (fol.get('desired') or [None, None]) if fol else [None, None]
                     bb = (tgt.get('bbox') or [None, None, None, None])
-                    row = [meta['frames'], '%.3f' % time.time(),
+                    row = [meta['frames'], '%.3f' % row_ts,
                            (fol.get('state') if fol else 'OFF'),
                            int(bool(fol.get('armed'))), int(bool(fol.get('steer_only'))),
                            fol.get('dist_m'), fol.get('lateral_m'),
@@ -804,6 +842,8 @@ def _demo_loop(path_base, stop_ev, meta):
         if log_f is not None:
             try: log_f.close()
             except Exception: pass
+        if meta.get('frames'):                       # 有帧才写 sidecar(空录不留垃圾文件)
+            _demo_write_meta(path_base, meta)
 
 
 def demo_start():
@@ -908,7 +948,9 @@ def status():
                  'elapsed': (int(time.time() - dm['start']) if S['demo'] and dm.get('start') else 0),
                  'error': dm.get('error')}
     try:
-        names = sorted([n for n in os.listdir(DEMO_DIR) if n.startswith('demo_')], reverse=True)[:5]
+        # 只列视频: 同目录还有同名 .csv 与 .meta.json, 不过滤会把这 5 个下载位挤掉
+        names = sorted([n for n in os.listdir(DEMO_DIR)
+                        if n.startswith('demo_') and n.endswith(('.mp4', '.avi'))], reverse=True)[:5]
         s['demos'] = [{'name': n, 'mb': round(os.path.getsize(os.path.join(DEMO_DIR, n)) / 1e6, 1)}
                       for n in names]
     except Exception:
@@ -1290,6 +1332,88 @@ setInterval(function(){fetch('/target').then(r=>r.json()).then(drawBox).catch(e=
 </script></body></html>"""
 
 
+# ================== /slate 电子场记板(多视角 Demo 的时间戳对齐) ==================
+# 用途: 手机开录前先拍这个页面 3 秒 → Mac 侧 tools/sync_phone.py 从手机视频里解出
+#       「手机第 0 帧 对应的车钟时刻」→ 与 demo CSV 的 ts 列对齐 → ffmpeg 合成四宫格。
+#
+# 为什么显示的是车钟而不是手机/浏览器钟: 页面加载时先跟 /now 做多次往返对时(取 RTT
+# 最小那次, NTP 式), 算出 offset, 之后一律显示 Date.now()+offset。这样即使拿平板/
+# 笔记本打开本页, 画面上的时间也是车上那台机器的钟, 消掉最大的一个误差源。
+#
+# 机读编码: 洋红(255,0,255)边框圈出的灰底色条里有 16 个格子(黑=0 白=1):
+#   格0=1 格1=0 (同步头) | 格2~13 = unix_ms & 0xFFF 的 12 位(高位在左) |
+#   格14 = 12 位的偶校验 | 格15=1 (同步尾)
+#   12 位 = 4096ms ≈ 4 秒内无歧义, 配合明文的秒即可完全还原。
+#   洋红在自然场景里极罕见 → 解码器先找洋红连通域定位色条, 再等分 16 格取中心亮度。
+# 人读兜底: 上方大号等宽明文时间, 自动解码失败时肉眼读一眼手输即可。
+#
+# ⚠ 本常量用 r-string: JS 里的 \n 保持字面量, 天然免疫 PAGE 那个「单 \n 被 Python
+#   变成真换行 → JS 字符串未闭合 → 整个 script 块 SyntaxError」的事故(见 2026-07-15)。
+SLATE_PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>场记板 SLATE</title><style>
+html,body{margin:0;padding:0;background:#000;color:#fff;height:100%;overflow:hidden;
+ font-family:ui-monospace,Menlo,Consolas,monospace;-webkit-user-select:none;user-select:none}
+#wrap{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2vh}
+/* 日期小、时刻大: 对齐只用得上时刻。字号按等宽字符宽≈0.6em 反推, 12 字符 × 0.6 × 11vw
+   = 79vw < 100vw, 留足边距不会像 8.5vw 那样把年份和毫秒切掉(实测 1280 宽溢出) */
+#day{font-size:3.2vw;color:#8b98a5;letter-spacing:.08em}
+#clk{font-size:11vw;font-weight:700;letter-spacing:.01em;line-height:1;white-space:nowrap}
+#epo{font-size:2.6vw;color:#8b98a5;letter-spacing:.04em;white-space:nowrap}
+/* 洋红边框必须直接贴住灰色色条: 中间若夹一圈黑底, 解码器按比例内缩剥不干净时
+   会把那圈黑当成额外的"格子"(实测切出 18 段而非 16 段 → 解码失败) */
+#frame{border:1.2vh solid #f0f;padding:0;background:#808080}
+#strip{display:flex;gap:.9vw;background:#808080;padding:1.2vh 1.2vw}
+.cell{width:4.6vw;height:13vh;background:#000}
+.on{background:#fff}
+#foot{font-size:2.1vw;color:#8b98a5;text-align:center;line-height:1.5}
+#sync{font-size:2.1vw}
+.ok{color:#22c55e}.bad{color:#f59e0b}
+</style></head><body><div id=wrap>
+<div id=day>-------_--</div>
+<div id=clk>--:--:--.---</div>
+<div id=epo>epoch --</div>
+<div id=frame><div id=strip></div></div>
+<div id=sync class=bad>对时中…</div>
+<div id=foot>手机横屏拍这块屏幕 3 秒, 再转身拍车<br>显示的是<b>车上那台机器</b>的钟</div>
+</div><script>
+var CELLS=16, cells=[], off=0, bestRtt=1e9, synced=0;
+(function(){var s=document.getElementById('strip');
+ for(var i=0;i<CELLS;i++){var d=document.createElement('div');d.className='cell';s.appendChild(d);cells.push(d);}})();
+
+/* NTP 式对时: 多次往返取 RTT 最小的一次, offset = t_car - (t0+t1)/2 */
+function probe(n){
+  if(n<=0){done();return;}
+  var t0=Date.now();
+  fetch('/now',{cache:'no-store'}).then(function(r){return r.json()}).then(function(j){
+    var t1=Date.now(), rtt=t1-t0;
+    if(rtt<bestRtt){bestRtt=rtt; off=j.ts*1000-(t0+t1)/2; synced=1;}
+    setTimeout(function(){probe(n-1)},120);
+  }).catch(function(){setTimeout(function(){probe(n-1)},400)});
+}
+function done(){
+  var e=document.getElementById('sync');
+  if(synced){e.className='ok';e.textContent='已对时 offset='+off.toFixed(0)+'ms  RTT='+bestRtt+'ms';}
+  else{e.className='bad';e.textContent='对时失败! 只能用明文时间人工对齐';}
+}
+function p(n,w){var s=''+n;while(s.length<w){s='0'+s;}return s;}
+function draw(){
+  var tc=Date.now()+off, d=new Date(tc), ms=Math.floor(tc)&0xFFF;
+  document.getElementById('day').textContent=
+    d.getFullYear()+'-'+p(d.getMonth()+1,2)+'-'+p(d.getDate(),2);
+  document.getElementById('clk').textContent=
+    p(d.getHours(),2)+':'+p(d.getMinutes(),2)+':'+p(d.getSeconds(),2)+'.'+p(d.getMilliseconds(),3);
+  document.getElementById('epo').textContent='epoch '+Math.floor(tc)+'   code 0x'+p(ms.toString(16).toUpperCase(),3);
+  var bits=[1,0], par=0;
+  for(var i=11;i>=0;i--){var b=(ms>>i)&1; bits.push(b); par^=b;}
+  bits.push(par); bits.push(1);
+  for(var k=0;k<CELLS;k++){cells[k].className=bits[k]?'cell on':'cell';}
+  requestAnimationFrame(draw);
+}
+probe(7); requestAnimationFrame(draw);
+</script></body></html>"""
+
+
 class TS(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
@@ -1304,6 +1428,11 @@ class H(BaseHTTPRequestHandler):
         p = self.path
         if p == '/' or p.startswith('/index'):
             self._s(200, 'text/html; charset=utf-8', PAGE.encode('utf-8'))
+        elif p.startswith('/slate'):
+            self._s(200, 'text/html; charset=utf-8', SLATE_PAGE.encode('utf-8'))
+        elif p.startswith('/now'):
+            # 极轻量对时端点: 只回车钟, 不做任何文件/子进程操作(那会给 RTT 加抖动)
+            self._s(200, 'application/json', json.dumps({'ts': time.time()}).encode())
         elif p.startswith('/status'):
             self._s(200, 'application/json', json.dumps(status()).encode())
         elif p.startswith('/target'):

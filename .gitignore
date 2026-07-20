@@ -4,6 +4,8 @@
 !/.gitignore
 !/README.md
 !/code
+!/tools
+!/计划书-*.md
 !/follow_data_collector
 !/experiment_plan.html
 !/todo.html
@@ -14,4 +16,6 @@
 **/*.py[cod]
 
 # 说明: 两篇 PDF 文档含车内网IP+登录密码, 故不跟踪(敏感);
-#       大体积素材(*.mp4 / *.onnx / dataset/ / *.csv 等)也不跟踪。
+#       大体积素材(*.mp4 / *.onnx / dataset/ / *.csv 等)也不跟踪;
+#       surf_golf/(厂家随车资料)含报价金额与业务员手机号, 保持不跟踪 ——
+#         其中的技术参数(车辆尺寸/轴距/最小转弯半径/传感器清单)已摘进计划书 §3。
